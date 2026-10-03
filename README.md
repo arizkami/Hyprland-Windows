@@ -35,7 +35,18 @@ For Visual Studio 2026, use `-G "Visual Studio 18 2026"` instead. The verified b
 
 Yoga 3.2.1 is pinned to commit `042f5013152eb81c1552dec945b88f7b95ca350f`. Only `yogacore` is built: its upstream test dependencies are not fetched. There are no other new third-party runtime libraries. To build offline after obtaining the matching source, pass `-DFETCHCONTENT_SOURCE_DIR_YOGA=C:/path/to/yoga` at configure time. CMake downloads dependencies into the ignored build directory.
 
-The inherited root `CMakeLists.txt`, `src/`, Linux build instructions and Linux tooling remain unchanged. `cmake -S .` still selects that inherited build and is not a Windows build command.
+The root CMake entry now selects `windows/` on WIN32 before running Linux shader generators or dependency discovery. The original `src/main.cpp` uses `_WIN32` to dispatch to the native platform entry; the Linux entry stays under the other branch. Root configuration requires CMake 3.30+, while the isolated `-S windows` path still requires 3.24+.
+
+From the repository root with VS 2026, the integrated build is:
+
+```powershell
+cmake -S . -B windows/build-root -G "Visual Studio 18 2026" -A x64
+cmake --build windows/build-root --config Release --parallel 4
+ctest --test-dir windows/build-root -C Release --output-on-failure
+.\windows\build-root\windows\Release\HyprlandWindows.exe
+```
+
+On Linux the root build retains its existing compositor, dependencies and startup. Shared geometry is built by both platforms; Linux-only services are not compiled into the Windows executable.
 
 ## Controls and restoration
 
@@ -58,17 +69,18 @@ Original WINDOWPLACEMENT is saved immediately before first managing a window, in
 
 | Layer | Files | Responsibility |
 | --- | --- | --- |
-| Portable policy | `windows/src/Layout.*` | Geometry, Dwindle/Master math, filtering policy and directional selection; no Win32/Yoga |
-| Win32 integration | `windows/src/WindowManager.*` | Discovery, identity, hooks, metadata, work areas, constraints, placement and restoration |
+| Shared inherited geometry | `src/layout/algorithm/tiled/GeometryMath.*` | Dwindle split extents, Master fractions/column partitioning, exact native pixel quantization; no platform dependencies |
+| Portable policy | `windows/src/Layout.*` | Native layout policy, filtering and directional selection using shared geometry; no Win32/Yoga |
+| Win32 integration | `windows/platform/win32/WindowManager.*` | Discovery, identity, hooks, metadata, work areas, constraints, placement and restoration |
 | UI layout | `windows/src/Panel.*` | Yoga Flexbox layout, drawing commands, rounded/clipped hit regions, control state |
 | GraphicEngineCore | `windows/src/Graphics.*` | D3D11/HLSL shapes, D2D GPU text rasterization, DirectWrite fallback, DXGI presentation and composition resources |
-| Application | `windows/src/Main.cpp` | Window/message lifecycle, DPI, inputs, hotkeys and one-shot scheduling |
+| Application | `src/main.cpp` → `windows/platform/win32/EntryPoint.hpp` / `Application.cpp` | Platform selection, native window/message lifecycle, DPI, inputs, hotkeys and one-shot scheduling |
 
 The panel's background, controls and text share one swap chain and one composition visual. Layout nodes, drawing commands and the composition layer are separate. DirectComposition only composes this application's visual. Direct2D rasterizes DirectWrite layouts directly onto the DXGI surface, using grayscale text antialiasing on a premultiplied-alpha target. HLSL emits premultiplied colors and uses matching source-over blending.
 
 The UI thread owns all D3D11 immediate-context use, D2D operations and management state. Hook callbacks only post events to the Win32 queue. Structural changes trigger a debounced relayout; duplicate geometry feedback does not repeat unchanged placement requests. A one-shot reconciliation handles delayed application/DWM updates without an idle timer. ABI pointers are confined to Win32/COM/Yoga interfaces; ownership uses WRL ComPtr, standard C++ RAII and a Yoga tree wrapper, avoiding a dependency on the Linux-oriented Hyprutils build.
 
-The layout mathematics were adapted after inspecting upstream `src/layout/algorithm/tiled/dwindle/DwindleAlgorithm.cpp` and `master/MasterAlgorithm.cpp`. The original compositor globals, Wayland targets and Linux services are not linked into the Windows application. Upstream attribution and the BSD license are retained.
+The original Dwindle and Master implementations now call shared GeometryMath functions. Their split ratios, floating-point operation order and float assignment boundaries are retained, and Windows uses the same split kernel with a separate exact integer Master quantizer. Regression tests compare the extracted functions to the inherited formulas, including fractional sizes and asymmetric splits. The original compositor globals, Wayland targets and Linux services are not linked into the Windows application. Upstream attribution and the BSD license are retained.
 
 ## Tests and observed validation
 
@@ -78,12 +90,12 @@ Close any running Hyprland Windows panel before the native test. On an interacti
 ctest --test-dir windows/build -C Release --output-on-failure
 ```
 
-Three suites cover geometry/filter policy, Yoga layout and rounded/clip hit testing, and a native integration harness. The harness creates its own test windows and launches the manager with `--test-process <fixture PID>`, restricting discovery/hooks/placement to that process. It exercises actual hotkeys using SendInput, changes foreground focus, and closes its fixtures afterward. It never enables management of the user's other applications. The scoped mode also exposes local WM_APP test controls/telemetry; normal launches ignore those messages. It must not be used as a production IPC API.
+Four suites cover geometry/filter policy, shared inherited math regression, Yoga layout and rounded/clip hit testing, and a native integration harness. The harness creates its own test windows and launches the manager with `--test-process <fixture PID>`, restricting discovery/hooks/placement to that process. It exercises actual hotkeys using SendInput, changes foreground focus, and closes its fixtures afterward. It never enables management of the user's other applications. The scoped mode also exposes local WM_APP test controls/telemetry; normal launches ignore those messages. It must not be used as a production IPC API.
 
 For a headless Windows build, run only the unit suites:
 
 ```powershell
-ctest --test-dir windows/build -C Release -R "layout_policy|panel_layout_clipping" --output-on-failure
+ctest --test-dir windows/build -C Release -R "layout_policy|inherited_geometry_regression|panel_layout_clipping" --output-on-failure
 ```
 
 The geometry/policy suite can also configure on other platforms without Yoga or Windows dependencies:
@@ -104,6 +116,8 @@ Validation on 2026-10-04:
 - Real GPU device removal/reset recovery, Windows 10 execution, long-duration desktop operation, diverse third-party application compatibility, elevated/hung applications and deterministic same-process HWND reuse are not runtime-verified. Device-loss recovery paths exist but should not be described as hardware-reset tested.
 
 ## Limitations and remaining roadmap
+
+Integration follow-up on 2026-10-04: both the root WIN32 build and isolated Windows build passed with MSVC. All four suites passed through the root build, including the original-source entry point and native lifecycle/restoration. Portable layout and shared-geometry suites also passed with GCC 16.2.1 in Arch WSL, and the two new tests under `tests/layout/TiledGeometryMath.cpp` passed when built against the installed GoogleTest 1.18.0. The root native idle sample recorded 15 ms CPU time over 1.1 seconds with no frames presented. The full Linux compositor build/runtime has not been verified in this follow-up; these Linux checks cover the extracted numerical code, not Wayland/Aquamarine integration.
 
 This is a reversible native prototype, not a production window manager. Panel settings are session-only. There are no inherited configuration-option changes or promises of Linux config/plugin compatibility. Resizable windows are considered candidates, so specialized applications may need manual floating opt-out. Fullscreen applications, application-specific window rules, advanced minimum-size allocation and comprehensive shell-class compatibility need further work. Work-area overcapacity leaves windows at their original placements; constrained windows float rather than forcing an invalid layout.
 

@@ -1,5 +1,6 @@
-#include "Graphics.hpp"
-#include "Panel.hpp"
+#include "EntryPoint.hpp"
+#include "../../src/Graphics.hpp"
+#include "../../src/Panel.hpp"
 #include "WindowManager.hpp"
 #include <shellapi.h>
 #include <windowsx.h>
@@ -315,7 +316,7 @@ int CApplication::run() {
     return result == -1 ? 1 : static_cast<int>(message.wParam);
 }
 
-int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
+int WindowsPlatform::runApplication() {
     try {
         const auto                                   closeHandle = [](void* handle) { CloseHandle(handle); };
         std::unique_ptr<void, decltype(closeHandle)> instance(CreateMutexW(nullptr, FALSE, L"Local\\HyprlandWindowsNative"), closeHandle);

@@ -2,6 +2,7 @@
 // src/layout/algorithm/tiled/{dwindle,master} (BSD-3-Clause, see ../../LICENSE).
 // Platform objects, global state and compositor policy are intentionally absent.
 #include "Layout.hpp"
+#include "../../src/layout/algorithm/tiled/GeometryMath.hpp"
 #include <algorithm>
 #include <cmath>
 #include <limits>
@@ -42,7 +43,7 @@ namespace WindowsTiling {
                 if (size < 2)
                     return {}; // Cannot fit nonempty disjoint cells: leave windows floating.
                 const int g     = std::min(gap, size - 2);
-                const int first = (size - g) / 2;
+                const int first = static_cast<int>(Layout::Tiled::GeometryMath::dwindleExtent(size - g, 1.0));
                 SRect     leaf  = area;
                 if (horizontal) {
                     leaf.width = first;
@@ -69,7 +70,7 @@ namespace WindowsTiling {
             if (area.width < 2 || ids.size() - 1 > static_cast<size_t>(area.height))
                 return {};
             const int g      = std::min(gap, area.width - 2);
-            const int master = (area.width - g) * 3 / 5;
+            const int master = Layout::Tiled::GeometryMath::masterPixels(area.width - g, 3, 5);
             result.push_back({
                 ids.front(),
                 {

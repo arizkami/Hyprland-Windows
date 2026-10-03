@@ -1,4 +1,5 @@
 #include "MasterAlgorithm.hpp"
+#include "../GeometryMath.hpp"
 #include "../../../../helpers/MiscFunctions.hpp"
 #include "../../../../desktop/view/window/WindowPresentation.hpp"
 
@@ -30,9 +31,7 @@ using namespace Hyprutils::String;
 // count puts the extra slave there: left by default, right when extraToRight. calculateWorkspace
 // and resizeTarget must both split via this or they disagree for odd counts. Returns {left, right}.
 static std::pair<int, int> centerSlaveColumns(int slaveCount, bool extraToRight) {
-    const int LARGER  = 1 + (slaveCount - 1) / 2; // ceil, holds the odd one
-    const int SMALLER = slaveCount - LARGER;
-    return extraToRight ? std::pair{SMALLER, LARGER} : std::pair{LARGER, SMALLER};
+    return GeometryMath::centerSlaveColumns(slaveCount, extraToRight);
 }
 
 void CMasterAlgorithm::newTarget(SP<ITarget> target) {
@@ -88,8 +87,8 @@ void CMasterAlgorithm::addTarget(SP<ITarget> target, bool firstMap) {
     float        lastSplitPercent   = *PMFACT;
 
     auto         OPENINGON = isWindowTiled(Desktop::focusState()->window()) && Desktop::focusState()->window()->m_workspace == PWORKSPACE ?
-        getNodeFromWindow(Desktop::focusState()->window()) :
-        getMasterNode();
+                getNodeFromWindow(Desktop::focusState()->window()) :
+                getMasterNode();
 
     const auto   MOUSECOORDS = g_pInputManager->getMouseCoordsInternal();
     eOrientation orientation = getDynamicOrientation();
@@ -1152,7 +1151,7 @@ void CMasterAlgorithm::calculateWorkspace() {
         float       nextY       = 0;
 
         if (STACKWINDOWS > 0 || centerMasterWindow)
-            WIDTH *= PMASTERNODE->percMaster;
+            WIDTH = GeometryMath::masterExtent(WIDTH, PMASTERNODE->percMaster);
 
         if (orientation == ORIENTATION_RIGHT)
             nextX = WORKAREA.w - WIDTH;

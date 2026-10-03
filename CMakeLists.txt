@@ -1,5 +1,13 @@
 cmake_minimum_required(VERSION 3.30)
 
+# Select the native platform before any Linux generators or package discovery.
+if(WIN32)
+  project(HyprlandWindowsPlatform LANGUAGES CXX)
+  include(CTest)
+  add_subdirectory(windows)
+  return()
+endif()
+
 # Get version
 file(READ "${CMAKE_SOURCE_DIR}/VERSION" VER_RAW)
 string(STRIP ${VER_RAW} VER)

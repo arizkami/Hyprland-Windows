@@ -1,3 +1,10 @@
+#ifdef _WIN32
+#include "../windows/platform/win32/EntryPoint.hpp"
+
+int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
+    return WindowsPlatform::runApplication();
+}
+#else
 #include "defines.hpp"
 #include "helpers/MiscFunctions.hpp"
 #include "debug/log/Logger.hpp"
@@ -307,3 +314,4 @@ int main(int argc, char** argv) {
 
     return EXIT_SUCCESS;
 }
+#endif
