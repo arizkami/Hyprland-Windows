@@ -1,150 +1,95 @@
-<div align = center>
+# Hyprland Windows
 
-<img src="https://raw.githubusercontent.com/hyprwm/Hyprland/main/assets/header.svg" width="750" height="300" alt="banner">
+An experimental Windows adaptation of [Hyprland](https://github.com/hyprwm/Hyprland), bringing its dynamic tiling workflow and visual design to native Windows applications.
 
-<br>
+This fork is maintained independently by [arizkami](https://github.com/arizkami). It is not an official Hyprland project and is not affiliated with or endorsed by the upstream maintainers.
 
-[![Badge Workflow]][Workflow]
-[![Badge License]][License] 
-![Badge Language] 
-[![Badge Pull Requests]][Pull Requests] 
-[![Badge Issues]][Issues] 
-![Badge Hi Mom]<br>
+> **Status: early development.** The repository currently contains the inherited Hyprland codebase. The native Windows backend and GraphicEngineCore described below are planned work, not implemented features. There is no supported Windows build or installation procedure yet.
 
-<br>
+## Direction
 
-Hyprland is a 100% independent, dynamic tiling Wayland compositor that doesn't sacrifice on its looks.
+Hyprland Windows aims to combine dynamic window management with a native, GPU-rendered desktop interface.
 
-It provides the latest Wayland features, is highly customizable, has all the eyecandy, the most powerful plugins,
-easy IPC, much more QoL stuff than other compositors and more...
-<br>
-<br>
+The Windows adaptation will require substantial rewrites of the platform-dependent code. Layout algorithms, window rules, workspace policies, keybinding behavior, and animation mathematics will be adapted where practical. Wayland surfaces, Linux input handling, display output, and platform integration will be replaced with Windows implementations.
 
----
+On Windows, the Desktop Window Manager (DWM) remains responsible for desktop composition. This project will manage native application windows through Win32 APIs and render its own interface through Direct3D and DirectComposition. It does not replace DWM or provide a Wayland session for Windows applications.
 
-**[<kbd> <br> Install <br> </kbd>][Install]** 
-**[<kbd> <br> Quick Start <br> </kbd>][Quick Start]** 
-**[<kbd> <br> Configure <br> </kbd>][Configure]** 
-**[<kbd> <br> Contribute <br> </kbd>][Contribute]**
+## Planned architecture
 
----
+### GraphicEngineCore
 
-<br>
+GraphicEngineCore is the planned graphics and UI foundation:
 
-</div>
+**DXGI + DirectComposition + Direct3D 11 + HLSL + DirectWrite + Yoga**
 
-# Features
+| Component | Responsibility |
+| --- | --- |
+| Direct3D 11 | GPU resources, textures, buffers, and rendering passes |
+| HLSL | Custom drawing, rounded shapes, gradients, shadows, blur, and other shader effects |
+| DXGI | Graphics adapters, swap chains, and presentation |
+| DirectComposition | Composition of the project's visual layers, transforms, clipping, opacity, and animations |
+| DirectWrite | Text shaping, layout, font fallback, and glyph metrics |
+| Yoga | Flexbox layout for the project's UI widgets |
+| Win32 | Native windows, message loop, input, DPI, and platform lifecycle |
 
-- All of the eyecandy: gradient borders, many types of blur, animations, glow, shadows and much more
-- A lot of customization
-- 100% independent, no wlroots, no libweston, no kwin, no mutter.
-- Custom bezier and spring curves for the best animations
-- Powerful plugin support
-- Built-in plugin manager
-- Tearing support for better gaming performance
-- Easily expandable and readable codebase
-- Fast and active development
-- Not afraid to provide bleeding-edge features
-- Config reloaded instantly upon saving
-- Global keybinds passed to your apps of choice
-- Tiling/pseudotiling/floating/fullscreen windows
-- Special workspaces (scratchpads)
-- Window groups (tabbed mode)
-- Powerful window/monitor/layer rules
-- Socket-based IPC
-- Native IME and Input Panels Support
-- Fully dynamic workspaces
-- Extensive layout support
-    - Dwindle
-    - Scrolling
-    - Master
-    - Monocle
-    - Custom layout with Lua
-    - Custom layouts with plugins
-- Per Workspace Layouts
-- and much more...
+The graphics engine will keep UI layout, drawing commands, and composition layers separate. Text rasterization and caching will be integrated with the rendering backend.
 
-<br>
-<br>
+Yoga will arrange UI widgets such as panels, launchers, and settings. Dynamic tiling layouts will use their own layout algorithms rather than being represented as Flexbox layouts.
 
-<div align = center>
+### Window management
 
-# Gallery
+A separate window-management core will track native `HWND` windows and maintain layout, workspace, rule, and focus state.
 
-<br>
+Planned Windows integration includes:
 
-![Preview A]
+- Window discovery and lifecycle tracking through `EnumWindows` and `SetWinEventHook`.
+- Window placement through `SetWindowPos` and deferred positioning APIs.
+- Global shortcuts and input handling through Win32 hotkeys, Raw Input, and hooks where needed.
+- Per-monitor DPI handling and work-area awareness.
+- Windows-native configuration watching and IPC.
+- Project-owned borders, panels, popups, and workspace UI rendered by GraphicEngineCore.
 
-<br>
+The core should operate on window IDs, geometry, constraints, and commands so that layout policy remains separate from Win32 calls.
 
-![Preview B]
+## Roadmap
 
-<br>
+All items below are planned; this list does not describe currently working Windows functionality.
 
-![Preview C]
+1. **Native foundation:** establish the Windows build, application lifecycle, and GraphicEngineCore rendering prototype.
+2. **Window management:** discover and track native windows; implement Dwindle and Master tiling, gaps, floating windows, and basic shortcuts.
+3. **Application compatibility:** handle dialogs, owned windows, size constraints, fullscreen behavior, multiple monitors, and mixed DPI.
+4. **Configuration and control:** adapt window rules, configuration reload, command dispatch, and IPC.
+5. **Desktop interface:** add custom borders, panels, a launcher, and workspace controls.
+6. **Workspaces and effects:** develop workspace visibility policies, previews, and transitions; investigate capture-based effects where appropriate.
+7. **Reliability:** restore managed window state on exit, recover graphics resources after device loss, and expand compatibility testing.
 
-<br>
-<br>
+## Windows boundaries
 
-</div>
+Native Windows applications retain their own rendering and window behavior. Managing their position is different from composing their surfaces directly.
 
-# Special Thanks
+- DirectComposition can animate the project's own visuals; it does not automatically grant control over every application's composition tree.
+- Moving or resizing a live application window may trigger application redraws and is not equivalent to transforming a texture.
+- Captured window previews may support overview and transition effects, but they introduce capture, visibility, latency, and input constraints.
+- Focus changes are subject to Windows foreground-activation rules.
+- Hyprland-style workspaces require a Windows-specific implementation. Full compatibility with Windows virtual desktops is not assumed.
+- Linux/Wayland plugins, configuration actions, and integrations are not automatically compatible with this fork.
 
-<br>
+## Building
 
-**[wlroots]** - *For powering Hyprland in the past*
+A supported native Windows build is not available yet.
 
-**[tinywl]** - *For showing how 2 do stuff*
+The existing CMake files, dependencies, scripts, and Linux/Wayland documentation are inherited from upstream. They should not be treated as Windows build instructions. Windows prerequisites and build steps will be documented when the first native backend is available.
 
-**[Sway]** - *For showing how 2 do stuff the overkill way*
+## Contributing
 
-**[Vivarium]** - *For showing how 2 do stuff the simple way*
+Windows adaptation work belongs in [arizkami/Hyprland-Windows](https://github.com/arizkami/Hyprland-Windows). Target this fork for Windows-specific pull requests and development; do not submit this fork's porting work to the upstream Hyprland repository.
 
-**[dwl]** - *For showing how 2 do stuff the hacky way*
+Contributions should clearly distinguish planned behavior from implemented and tested functionality. Preserve upstream attribution and applicable license notices when adapting code.
 
-**[Wayfire]** - *For showing how 2 do some graphics stuff*
+## Credits and license
 
+This project builds on [Hyprland](https://github.com/hyprwm/Hyprland), created by vaxerski and its contributors. Their work provides the foundation for this adaptation.
 
-<!----------------------------------------------------------------------------->
+The inherited Hyprland code is licensed under the **BSD 3-Clause License**. See [LICENSE](LICENSE). Retain the applicable copyright, license conditions, and disclaimer when redistributing adapted source or binaries.
 
-[Configure]: https://wiki.hypr.land/configuring/
-[Stars]: https://starchart.cc/hyprwm/Hyprland
-[Hypr]: https://github.com/hyprwm/Hypr
-
-[Pull Requests]: https://github.com/hyprwm/Hyprland/pulls
-[Issues]: https://github.com/hyprwm/Hyprland/issues
-[Todo]: https://github.com/hyprwm/Hyprland/projects?type=beta
-
-[Contribute]: https://wiki.hypr.land/contributing-and-debugging/
-[Install]: https://wiki.hypr.land/getting-started/installation/
-[Quick Start]: https://wiki.hypr.land/getting-started/master-tutorial/
-[Workflow]: https://github.com/hyprwm/Hyprland/actions/workflows/ci.yaml
-[License]: LICENSE
-
-
-<!----------------------------------{ Thanks }--------------------------------->
-
-[Vivarium]: https://github.com/inclement/vivarium
-[WlRoots]: https://gitlab.freedesktop.org/wlroots/wlroots
-[Wayfire]: https://github.com/WayfireWM/wayfire
-[TinyWl]: https://gitlab.freedesktop.org/wlroots/wlroots/-/blob/master/tinywl/tinywl.c
-[Sway]: https://github.com/swaywm/sway
-[DWL]: https://codeberg.org/dwl/dwl
-
-<!----------------------------------{ Images }--------------------------------->
-
-[Preview A]: ./assets/prev1.png
-[Preview B]: ./assets/prev2.png
-[Preview C]: ./assets/prev3.png
-
-
-<!----------------------------------{ Badges }--------------------------------->
-
-[Badge Workflow]: https://github.com/hyprwm/Hyprland/actions/workflows/ci.yaml/badge.svg
-
-[Badge Issues]: https://img.shields.io/github/issues/hyprwm/Hyprland
-[Badge Pull Requests]: https://img.shields.io/github/issues-pr/hyprwm/Hyprland
-[Badge Language]: https://img.shields.io/github/languages/top/hyprwm/Hyprland
-[Badge License]: https://img.shields.io/github/license/hyprwm/Hyprland
-[Badge Lines]: https://img.shields.io/tokei/lines/github/hyprwm/Hyprland
-[Badge Hi Mom]: https://img.shields.io/badge/Hi-mom!-ff69b4
+Third-party components retain their own licenses and notices.
