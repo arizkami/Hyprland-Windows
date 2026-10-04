@@ -1,6 +1,8 @@
 #include "SecurityContext.hpp"
 #include "../Compositor.hpp"
+#ifndef _WIN32
 #include <sys/socket.h>
+#endif
 using namespace Hyprutils::OS;
 
 static int onListenFdEvent(int fd, uint32_t mask, void* data) {
@@ -149,7 +151,12 @@ void CSecurityContext::onListen(uint32_t mask) {
     if (!(mask & WL_EVENT_READABLE))
         return;
 
+#ifdef _WIN32
+    // Sandboxed clients arrive over Unix sockets, which carry no Wayland clients on Windows.
+    CFileDescriptor clientFD;
+#else
     CFileDescriptor clientFD{accept(m_listenFD.get(), nullptr, nullptr)};
+#endif
     if UNLIKELY (!clientFD.isValid()) {
         LOG(Log::ERR, "security_context at 0x{:x} couldn't accept", (uintptr_t)this);
         return;

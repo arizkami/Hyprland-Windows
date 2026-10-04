@@ -1,7 +1,11 @@
 #include "S1.hpp"
 
 #include "Commands.hpp"
+#ifdef _WIN32
+#include "../../../windows/platform/win32/ipc/Sockets.hpp"
+#else
 #include "Unix.hpp"
+#endif
 #include "../../debug/log/Logger.hpp"
 
 #include <algorithm>
@@ -36,7 +40,12 @@ UP<CSocket1>& IPC::Socket1::sock() {
     return socket;
 }
 
-CSocket1::CSocket1() : m_impl(makeUnique<CUnixImpl>()) {
+#ifdef _WIN32
+CSocket1::CSocket1() : m_impl(makeWindowsImplementation())
+#else
+CSocket1::CSocket1() : m_impl(makeUnique<CUnixImpl>())
+#endif
+ {
     registerBuiltinCommands(*this);
     m_impl->start([this](std::string&& request, pid_t pid) { return dispatch(std::move(request), pid); });
 }

@@ -1,3 +1,5 @@
+// Windows: windows/platform/win32/ipc/Sockets.cpp (named pipes)
+#ifndef _WIN32
 #include "Unix.hpp"
 
 #include "../../Compositor.hpp"
@@ -207,3 +209,4 @@ bool CUnixImpl::send(std::string&& x) {
 
     return true;
 }
+#endif

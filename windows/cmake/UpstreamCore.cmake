@@ -49,6 +49,13 @@ target_include_directories(libinput_headers INTERFACE "${libinput_SOURCE_DIR}/sr
 add_library(xkbcommon_headers INTERFACE)
 target_include_directories(xkbcommon_headers INTERFACE "${xkbcommon_SOURCE_DIR}/include")
 
+# udis86 (plugin function hooks) from the upstream subproject, as the Linux build's
+# fallback does. Its itab.c/h are generated into the subproject by Python.
+find_package(Python3 COMPONENTS Interpreter REQUIRED)
+add_subdirectory("${CMAKE_CURRENT_LIST_DIR}/../../subprojects/udis86/libudis86" "${CMAKE_CURRENT_BINARY_DIR}/udis86")
+target_include_directories(libudis86 PUBLIC "${CMAKE_CURRENT_LIST_DIR}/../../subprojects/udis86")
+target_compile_options(libudis86 PRIVATE /W1 /wd4996)
+
 find_package(unofficial-lua CONFIG REQUIRED)
 find_package(re2 CONFIG REQUIRED)
 find_package(muparser CONFIG REQUIRED)
@@ -207,7 +214,8 @@ set(HYPRLAND_WINDOWS_PLATFORM_SOURCES
 # ported sources list as their upstream counterparts are ported.
 set(HYPRLAND_WINDOWS_CLASS_SOURCES
     "${CMAKE_CURRENT_LIST_DIR}/../platform/win32/ConfigWatcher.cpp"
-    "${CMAKE_CURRENT_LIST_DIR}/../platform/win32/InitHelpers.cpp")
+    "${CMAKE_CURRENT_LIST_DIR}/../platform/win32/InitHelpers.cpp"
+    "${CMAKE_CURRENT_LIST_DIR}/../platform/win32/ipc/Sockets.cpp")
 
 add_library(hyprland_core STATIC ${HYPRLAND_PORTED_SOURCES} ${HYPRLAND_WINDOWS_PLATFORM_SOURCES})
 target_include_directories(hyprland_core PUBLIC "${HYPRLAND_SOURCE_DIR}/src" "${HYPRLAND_GENERATED_DIR}")
@@ -216,7 +224,7 @@ target_compile_definitions(hyprland_core PUBLIC HYPRLAND_VERSION="${HYPRLAND_VER
 target_compile_features(hyprland_core PUBLIC cxx_std_23)
 # Platform.hpp supplies POSIX vocabulary types to every upstream translation unit.
 target_compile_options(hyprland_core PUBLIC /EHsc /utf-8 /permissive- /Zc:__cplusplus /Zc:preprocessor "/FI${HYPRLAND_PLATFORM_HEADER}" PRIVATE /W1)
-target_link_libraries(hyprland_core PUBLIC hyprland_posix hyprutils hyprlang hyprgraphics_color aquamarine libdrm_headers xkbcommon_headers libinput_headers wayland_server hyprland_protocols_interface unofficial::lua::lua re2::re2 muparser::muparser)
+target_link_libraries(hyprland_core PUBLIC hyprland_posix hyprutils hyprlang hyprgraphics_color aquamarine libdrm_headers xkbcommon_headers libinput_headers wayland_server hyprland_protocols_interface libudis86 unofficial::lua::lua re2::re2 muparser::muparser)
 
 if(BUILD_TESTING)
     # Upstream unit tests (tests/) whose dependencies are all ported.

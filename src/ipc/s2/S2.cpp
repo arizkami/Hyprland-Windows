@@ -1,7 +1,11 @@
 #include "S2.hpp"
 #include <algorithm>
 
+#ifdef _WIN32
+#include "../../../windows/platform/win32/ipc/Sockets.hpp"
+#else
 #include "Unix.hpp"
+#endif
 
 using namespace IPC;
 using namespace IPC::Socket2;
@@ -11,7 +15,12 @@ UP<CSocket2>& IPC::Socket2::sock() {
     return p;
 }
 
-CSocket2::CSocket2() : m_impl(makeUnique<CUnixImpl>()) {
+#ifdef _WIN32
+CSocket2::CSocket2() : m_impl(makeWindowsImplementation())
+#else
+CSocket2::CSocket2() : m_impl(makeUnique<CUnixImpl>())
+#endif
+ {
     ;
 }
 

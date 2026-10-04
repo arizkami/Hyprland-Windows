@@ -1,3 +1,5 @@
+// Windows: windows/platform/win32/ipc/Sockets.cpp (named pipes)
+#ifndef _WIN32
 #include "Unix.hpp"
 
 #include "../../Compositor.hpp"
@@ -406,3 +408,4 @@ void CUnixImpl::flushFollowers() {
 bool CUnixImpl::hasFollowers() const {
     return std::ranges::any_of(m_peers, [](const auto& peer) { return peer->isFollowing(); });
 }
+#endif
