@@ -11,6 +11,9 @@
 
 #include <hyprutils/string/String.hpp>
 #include <chrono>
+#ifdef _WIN32
+#include "../../../../windows/platform/win32/Spawn.hpp"
+#endif
 
 using namespace Config::Supplementary;
 using namespace Hyprutils::String;
@@ -175,6 +178,22 @@ std::optional<uint64_t> CExecutor::spawnRawProc(const std::string& args, PHLWORK
 
     const auto HLENV = getHyprlandLaunchEnv(pInitialWorkspace);
 
+#ifdef _WIN32
+    // No fork/exec: spawn directly (or via cmd.exe for shell syntax). There is no
+    // WAYLAND_DISPLAY to export; Windows has no Wayland clients.
+    auto environment = HLENV;
+    if (!execRuleToken.empty())
+        environment.emplace_back(Desktop::Rule::EXEC_RULE_ENV_NAME, execRuleToken);
+
+    const auto PID = WindowsPlatform::spawnShellCommand(args, environment);
+    if (!PID) {
+        LOG(Log::DEBUG, "[executor] Failed to start process");
+        return std::nullopt;
+    }
+
+    LOG(Log::DEBUG, "[executor] Process created with pid {}", *PID);
+    return PID;
+#else
     pid_t      child = fork();
     if (child < 0) {
         LOG(Log::DEBUG, "Fail to fork");
@@ -212,4 +231,5 @@ std::optional<uint64_t> CExecutor::spawnRawProc(const std::string& args, PHLWORK
     LOG(Log::DEBUG, "[executor] Process created with pid {}", child);
 
     return child;
+#endif
 }

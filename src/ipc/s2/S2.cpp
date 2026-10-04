@@ -1,4 +1,5 @@
 #include "S2.hpp"
+#include <algorithm>
 
 #include "Unix.hpp"
 

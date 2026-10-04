@@ -296,7 +296,9 @@ void CCompositor::initServer(std::string socketName, int socketFd) {
         signal(SIGSEGV, handleUnrecoverableSignal);
         signal(SIGABRT, handleUnrecoverableSignal);
     }
+#ifndef _WIN32
     signal(SIGUSR1, handleUserSignal);
+#endif
 
     initManagers(STAGE_PRIORITY);
 
@@ -313,6 +315,12 @@ void CCompositor::initServer(std::string socketName, int socketFd) {
 
     std::vector<Aquamarine::SBackendImplementationOptions> implementations;
     Aquamarine::SBackendImplementationOptions              option;
+#ifdef _WIN32
+    // Windows: attached monitors and desktop input; DWM composites application windows.
+    option.backendType        = Aquamarine::eBackendType::AQ_BACKEND_WIN32;
+    option.backendRequestMode = Aquamarine::eBackendRequestMode::AQ_BACKEND_REQUEST_MANDATORY;
+    implementations.emplace_back(option);
+#else
     option.backendType        = Aquamarine::eBackendType::AQ_BACKEND_HEADLESS;
     option.backendRequestMode = Aquamarine::eBackendRequestMode::AQ_BACKEND_REQUEST_MANDATORY;
     implementations.emplace_back(option);
@@ -322,6 +330,7 @@ void CCompositor::initServer(std::string socketName, int socketFd) {
     option.backendType        = Aquamarine::eBackendType::AQ_BACKEND_WAYLAND;
     option.backendRequestMode = Aquamarine::eBackendRequestMode::AQ_BACKEND_REQUEST_FALLBACK;
     implementations.emplace_back(option);
+#endif
 
     m_aqBackend = CBackend::create(implementations, options);
 
@@ -383,6 +392,12 @@ void CCompositor::initServer(std::string socketName, int socketFd) {
     LOG(Log::DEBUG, "DRM syncobj timeline support: no (not linux)");
 #endif
 
+#ifdef _WIN32
+    // libwayland on Windows has no client transport, so there is no socket and no
+    // WAYLAND_DISPLAY. Application windows are native HWNDs (Win32 window backend).
+    if (!socketName.empty() || socketFd != -1)
+        LOG(Log::WARN, "Wayland sockets are not available on Windows; ignoring --socket/--wayland-fd");
+#else
     if (!socketName.empty() && socketFd != -1) {
         fcntl(socketFd, F_SETFD, FD_CLOEXEC);
         const auto RETVAL = wl_display_add_socket_fd(m_wlDisplay, socketFd);
@@ -418,6 +433,7 @@ void CCompositor::initServer(std::string socketName, int socketFd) {
     }
 
     setenv("WAYLAND_DISPLAY", m_wlDisplaySocket.c_str(), 1);
+#endif
     if (!getenv("XDG_CURRENT_DESKTOP")) {
         setenv("XDG_CURRENT_DESKTOP", "Hyprland", 1);
         m_desktopEnvSet = true;

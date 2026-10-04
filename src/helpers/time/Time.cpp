@@ -134,7 +134,7 @@ struct timespec Time::toTimespec(const steady_tp& tp) {
         diffFinal = timediff(diff2, diff);
 
     auto sum = timeadd(tpTime, diffFinal);
-    return timespec{.tv_sec = sum.first, .tv_nsec = sum.second};
+    return timespec{.tv_sec = static_cast<time_t>(sum.first), .tv_nsec = static_cast<long>(sum.second)};
 }
 
 Time::steady_dur Time::till(const timespec& ts) {

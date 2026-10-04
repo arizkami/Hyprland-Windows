@@ -58,8 +58,16 @@ struct SVersionInfo {
     std::string commits;
 };
 
+#ifdef _MSC_VER
+// MSVC rejects C linkage on functions returning class templates (SP<...>), which GCC
+// and Clang accept with a warning. Windows plugin loading (DLLs) resolves these
+// through C++ names instead.
+#define APICALL
+#define EXPORT __declspec(dllexport)
+#else
 #define APICALL extern "C"
 #define EXPORT  __attribute__((visibility("default")))
+#endif
 #define REQUIRED
 #define OPTIONAL
 #define HANDLE void*

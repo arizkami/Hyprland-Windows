@@ -27,21 +27,26 @@ namespace WindowsTiling {
       public:
         explicit CWindowManager(HWND panel, DWORD testProcess = 0);
         ~CWindowManager();
-        bool                event(DWORD type, HWND window);
-        void                setEnabled(bool enabled);
-        bool                enabled() const;
-        void                setLayout(ELayout layout);
-        ELayout             layout() const;
-        void                setGap(int gap);
-        int                 gap() const;
-        void                relayout();
-        void                reconcile();
-        void                toggleFloating();
-        void                focus(EDirection direction);
-        size_t              managedCount() const;
-        size_t              trackedCount() const;
-        const std::wstring& status() const;
-        void                refreshAll();
+        bool                       event(DWORD type, HWND window);
+        void                       setEnabled(bool enabled);
+        bool                       enabled() const;
+        void                       setLayout(ELayout layout);
+        ELayout                    layout() const;
+        void                       setGap(int gap);
+        int                        gap() const;
+        void                       relayout();
+        void                       reconcile();
+        void                       setGaps(int inner, int outer);
+        int                        outerGap() const;
+        bool                       toggleFloating(HWND window = nullptr);
+        bool                       focus(EDirection direction);
+        bool                       focusWindow(HWND window);
+        bool                       closeWindow(HWND window);
+        std::vector<SWindowRecord> snapshot() const;
+        size_t                     managedCount() const;
+        size_t                     trackedCount() const;
+        const std::wstring&        status() const;
+        void                       refreshAll();
 
       private:
         HWND                          m_panel       = nullptr;
@@ -49,6 +54,7 @@ namespace WindowsTiling {
         bool                          m_enabled     = false;
         ELayout                       m_layout      = ELayout::Dwindle;
         int                           m_gap         = 12;
+        int                           m_outerGap    = 12;
         WindowID                      m_nextID      = 1;
         std::map<HWND, SWindowRecord> m_windows;
         std::vector<HWINEVENTHOOK>    m_hooks;

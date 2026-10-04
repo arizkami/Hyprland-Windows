@@ -1,3 +1,7 @@
+#ifdef _WIN32
+#include "../../windows/platform/win32/Hyprctl.hpp"
+int wmain(int argc, wchar_t** argv) { return WindowsIPC::runHyprctl(argc, argv); }
+#else
 #include <re2/re2.h>
 
 #include <cctype>
@@ -602,3 +606,5 @@ int main(int argc, char** argv) {
     std::cout << std::flush;
     return exitStatus;
 }
+
+#endif

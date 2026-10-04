@@ -2,14 +2,28 @@
 #include "memory/Memory.hpp"
 
 #include <memory>
-#include <fcntl.h>
-#include <unistd.h>
 #include <cerrno>
-#include <sys/socket.h>
-#include <sys/un.h>
 #include <cstdlib>
 #include <cstring>
+#ifndef _WIN32
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#endif
 
+#ifdef _WIN32
+// Windows has no systemd: not booted with it, and no notification socket.
+int NSystemd::sdBooted() {
+    return false;
+}
+
+int NSystemd::sdNotify(int unsetEnvironment, const char* state) {
+    if (unsetEnvironment)
+        unsetenv("NOTIFY_SOCKET");
+    return 0;
+}
+#else
 int NSystemd::sdBooted() {
     if (!faccessat(AT_FDCWD, "/run/systemd/system/", F_OK, AT_SYMLINK_NOFOLLOW))
         return true;
@@ -57,3 +71,4 @@ int NSystemd::sdNotify(int unsetEnvironment, const char* state) {
 
     return -errno;
 }
+#endif

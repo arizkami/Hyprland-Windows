@@ -60,7 +60,7 @@ CMouse::CMouse(SP<Aquamarine::IPointer> mouse_) : m_mouse(mouse_) {
             .axis              = sc<wl_pointer_axis>(event.axis),
             .relativeDirection = sc<wl_pointer_axis_relative_direction>(event.direction),
             .delta             = event.delta,
-            .deltaDiscrete     = event.discrete,
+            .deltaDiscrete     = sc<int32_t>(event.discrete),
             .mouse             = true,
         });
     });

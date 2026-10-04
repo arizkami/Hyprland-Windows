@@ -24,7 +24,7 @@ SParseError CLuaConfigVec2::parse(lua_State* s) {
         if (!(in >> x >> y) || (in >> tail))
             return {.errorCode = PARSE_ERROR_BAD_VALUE, .message = "vec2 string requires exactly 2 numbers (e.g. \"1 1\")"};
 
-        vec = {x, y};
+        vec = {sc<float>(x), sc<float>(y)};
     } else {
         if (!lua_istable(s, -1))
             return {.errorCode = PARSE_ERROR_BAD_TYPE, .message = "vec2 type requires an array or string"};
@@ -48,7 +48,7 @@ SParseError CLuaConfigVec2::parse(lua_State* s) {
         double y = lua_tonumber(s, -1);
         lua_pop(s, 1);
 
-        vec = {x, y};
+        vec = {sc<float>(x), sc<float>(y)};
     }
 
     if (m_validator) {

@@ -1,10 +1,18 @@
 #include "CrashReporter.hpp"
 #include <fcntl.h>
 #include <sys/utsname.h>
-#include <link.h>
 #include <ctime>
 #include <cerrno>
 #include <sys/stat.h>
+#ifdef _WIN32
+#include <direct.h>
+#include <io.h>
+#include <process.h>
+#include "../../../windows/platform/win32/ProcessInfo.hpp"
+#define STDERR_FILENO 2
+#else
+#include <link.h>
+#endif
 #include <filesystem>
 #include "../../helpers/MiscFunctions.hpp"
 
@@ -43,7 +51,11 @@ static char const* getRandomMessage() {
 }
 
 [[noreturn]] static inline void exitWithError(char const* err) {
+#ifdef _WIN32
+    [[maybe_unused]] auto w = _write(STDERR_FILENO, err, sc<unsigned int>(strlen(err)));
+#else
     [[maybe_unused]] auto w = write(STDERR_FILENO, err, strlen(err));
+#endif
     // perror() is not signal-safe, but we use it here
     // because if the crash-handler already crashed, it can't get any worse.
     perror("");
@@ -61,10 +73,19 @@ void CrashReporter::createAndSaveCrash(int sig) {
 
         const auto                         HOME       = SignalSafe::getenv("HOME");
         const auto                         CACHE_HOME = SignalSafe::getenv("XDG_CACHE_HOME");
+#ifdef _WIN32
+        // Windows keeps per-user caches in %LOCALAPPDATA%; HOME is usually unset.
+        const auto LOCAL_APP_DATA = SignalSafe::getenv("LOCALAPPDATA");
+#endif
 
         if (CACHE_HOME && CACHE_HOME[0] != '\0') {
             reportPath += CACHE_HOME;
             reportPath += "/hyprland";
+#ifdef _WIN32
+        } else if (LOCAL_APP_DATA && LOCAL_APP_DATA[0] != '\0') {
+            reportPath += LOCAL_APP_DATA;
+            reportPath += "/hyprland";
+#endif
         } else if (HOME && HOME[0] != '\0') {
             reportPath += HOME;
             reportPath += "/.cache/hyprland";
@@ -73,12 +94,20 @@ void CrashReporter::createAndSaveCrash(int sig) {
             return;
         }
 
+#ifdef _WIN32
+        int ret = _mkdir(reportPath.getStr());
+#else
         int ret = mkdir(reportPath.getStr(), S_IRWXU);
+#endif
         if (ret < 0 && errno != EEXIST)
             exitWithError("failed to mkdir() crash report directory\n");
 
         reportPath += "/hyprlandCrashReport";
+#ifdef _WIN32
+        reportPath.writeNum(_getpid());
+#else
         reportPath.writeNum(getpid());
+#endif
         reportPath += ".txt";
 
         {
@@ -93,7 +122,11 @@ void CrashReporter::createAndSaveCrash(int sig) {
             stderrOut.flush();
         }
 
+#ifdef _WIN32
+        reportFd = _open(reportPath.getStr(), _O_WRONLY | _O_CREAT | _O_BINARY, _S_IREAD | _S_IWRITE);
+#else
         reportFd = open(reportPath.getStr(), O_WRONLY | O_CREAT, S_IRUSR | S_IWUSR);
+#endif
         if (reportFd < 0)
             exitWithError("Failed to open crash report path for writing");
     }
@@ -184,7 +217,9 @@ void CrashReporter::createAndSaveCrash(int sig) {
 
     const auto CALLSTACK = getBacktrace();
 
-#if defined(KERN_PROC_PATHNAME)
+#if defined(_WIN32)
+    const auto FPATH = std::filesystem::path(WindowsPlatform::executablePath(_getpid()).value_or("Hyprland.exe"));
+#elif defined(KERN_PROC_PATHNAME)
     int mib[] = {
         CTL_KERN,
 #if defined(__NetBSD__)
@@ -224,9 +259,9 @@ void CrashReporter::createAndSaveCrash(int sig) {
         addrs += std::format("0x{:x} ", vmaAddr);
     }
 #ifdef __clang__
-    const auto CMD = std::format("llvm-addr2line -e {} -Cf {}", FPATH.c_str(), addrs);
+    const auto CMD = std::format("llvm-addr2line -e {} -Cf {}", FPATH.string(), addrs);
 #else
-    const auto CMD = std::format("addr2line -e {} -Cf {}", FPATH.c_str(), addrs);
+    const auto CMD = std::format("addr2line -e {} -Cf {}", FPATH.string(), addrs);
 #endif
 
     const auto        ADDR2LINE = execAndGet(CMD.c_str());

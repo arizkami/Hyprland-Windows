@@ -104,7 +104,7 @@ CLayerShellResource::CLayerShellResource(SP<CZwlrLayerSurfaceV1> resource_, SP<C
 
     m_resource->setSetMargin([this](CZwlrLayerSurfaceV1* r, int32_t top, int32_t right, int32_t bottom, int32_t left) {
         markPending(STATE_MARGIN);
-        m_pending.margin = {left, right, top, bottom};
+        m_pending.margin = {sc<double>(left), sc<double>(right), sc<double>(top), sc<double>(bottom)};
     });
 
     m_resource->setSetKeyboardInteractivity([this](CZwlrLayerSurfaceV1* r, zwlrLayerSurfaceV1KeyboardInteractivity kbi) {

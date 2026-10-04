@@ -1,0 +1,1066 @@
+diff --git a/include/hyprutils/os/FileDescriptor.hpp b/include/hyprutils/os/FileDescriptor.hpp
+index d71ee76..306de44 100644
+--- a/include/hyprutils/os/FileDescriptor.hpp
++++ b/include/hyprutils/os/FileDescriptor.hpp
+@@ -1,6 +1,12 @@
+ #pragma once
+ 
++#ifdef _WIN32
++// Windows has no FD_CLOEXEC; CRT descriptors are not inherited unless requested.
++#define HYPRUTILS_DUPFD_CLOEXEC 0
++#else
+ #include <fcntl.h>
++#define HYPRUTILS_DUPFD_CLOEXEC F_DUPFD_CLOEXEC
++#endif
+ 
+ namespace Hyprutils::OS {
+     class CFileDescriptor {
+@@ -24,7 +30,7 @@ namespace Hyprutils::OS {
+         bool            setFlags(int flags);
+         int             take();
+         void            reset();
+-        CFileDescriptor duplicate(int flags = F_DUPFD_CLOEXEC) const;
++        CFileDescriptor duplicate(int flags = HYPRUTILS_DUPFD_CLOEXEC) const;
+ 
+         bool            isReadable() const;
+         bool            isClosed() const;
+diff --git a/include/hyprutils/os/Process.hpp b/include/hyprutils/os/Process.hpp
+index 2c53c86..f67c3f0 100644
+--- a/include/hyprutils/os/Process.hpp
++++ b/include/hyprutils/os/Process.hpp
+@@ -4,6 +4,9 @@
+ #include <vector>
+ #include <utility>
+ #include <sys/types.h>
++#ifdef _WIN32
++typedef int pid_t;
++#endif
+ 
+ namespace Hyprutils::OS {
+     class CProcess {
+diff --git a/include/hyprutils/os/Semaphore.hpp b/include/hyprutils/os/Semaphore.hpp
+index ec85c51..74ed48f 100644
+--- a/include/hyprutils/os/Semaphore.hpp
++++ b/include/hyprutils/os/Semaphore.hpp
+@@ -15,6 +15,10 @@ namespace Hyprutils::OS {
+         CSemaphore& operator=(CSemaphore&&)      = delete;
+ 
+       private:
++#ifdef _WIN32
++        void* m_handle = nullptr;
++#else
+         int m_fd = -1;
++#endif
+     };
+ };
+diff --git a/src/cli/ArgumentParser.cpp b/src/cli/ArgumentParser.cpp
+index 333d93e..6e346d1 100644
+--- a/src/cli/ArgumentParser.cpp
++++ b/src/cli/ArgumentParser.cpp
+@@ -1,5 +1,6 @@
+ #include "ArgumentParser.hpp"
+ 
++#include <array>
+ #include <format>
+ #include <vector>
+ #include <algorithm>
+diff --git a/src/cli/Logger.cpp b/src/cli/Logger.cpp
+index da5b4e4..35d116c 100644
+--- a/src/cli/Logger.cpp
++++ b/src/cli/Logger.cpp
+@@ -58,7 +58,9 @@ std::expected<void, std::string> CLogger::setOutputFile(const std::string_view&
+     if (!m_impl->m_logOfs.good())
+         return std::unexpected("Failed to open a write stream");
+ 
++#ifndef _WIN32
+     fcntl(m_impl->m_logOfs.native_handle(), F_SETFD, FD_CLOEXEC);
++#endif
+ 
+     m_impl->m_fileEnabled = true;
+     m_impl->updateParentShouldLog();
+diff --git a/src/eventLoop/backend/Win32.cpp b/src/eventLoop/backend/Win32.cpp
+new file mode 100644
+index 0000000..079d5e2
+--- /dev/null
++++ b/src/eventLoop/backend/Win32.cpp
+@@ -0,0 +1,131 @@
++#ifdef _WIN32
++
++#include "Backend.hpp"
++
++#ifndef WIN32_LEAN_AND_MEAN
++#define WIN32_LEAN_AND_MEAN
++#endif
++#include <windows.h>
++
++#include <algorithm>
++#include <format>
++#include <unordered_map>
++
++using namespace Hyprutils::EventLoop;
++using namespace Hyprutils::Memory;
++
++// Windows has no pollable descriptor equivalent for arbitrary CRT fds, so this backend
++// provides timers and cross-thread wakeups. FD sources fail registration explicitly.
++
++static std::string systemError(const std::string& operation) {
++    return std::format("{}: Win32 error {}", operation, GetLastError());
++}
++
++struct CEventLoopBackend::SBackendState {
++    HANDLE                         timer = nullptr;
++    HANDLE                         wake  = nullptr;
++    std::unordered_map<uintptr_t, int> registrations;
++
++    ~SBackendState() {
++        if (timer)
++            CloseHandle(timer);
++        if (wake)
++            CloseHandle(wake);
++    }
++};
++
++std::expected<CUniquePointer<CEventLoopBackend>, std::string> CEventLoopBackend::create() {
++    CUniquePointer<CEventLoopBackend> backend{new CEventLoopBackend};
++    backend->m_state = makeUnique<SBackendState>();
++
++    backend->m_state->timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
++    if (!backend->m_state->timer)
++        backend->m_state->timer = CreateWaitableTimerW(nullptr, FALSE, nullptr);
++    if (!backend->m_state->timer)
++        return std::unexpected(systemError("CreateWaitableTimer"));
++
++    backend->m_state->wake = CreateEventW(nullptr, FALSE, FALSE, nullptr);
++    if (!backend->m_state->wake)
++        return std::unexpected(systemError("CreateEvent"));
++
++    return backend;
++}
++
++CEventLoopBackend::~CEventLoopBackend() = default;
++
++int CEventLoopBackend::fd() const {
++    return -1;
++}
++
++std::expected<void, std::string> CEventLoopBackend::addFD(uintptr_t sourceID, int fd, FdEventMask mask) {
++    if (m_state->registrations.contains(sourceID))
++        return std::unexpected("file descriptor source is already registered");
++    if (mask)
++        return std::unexpected("file descriptor sources are not supported on Windows");
++
++    m_state->registrations.emplace(sourceID, fd);
++    return {};
++}
++
++std::expected<void, std::string> CEventLoopBackend::updateFD(uintptr_t sourceID, int fd, FdEventMask mask) {
++    const auto registrationIt = m_state->registrations.find(sourceID);
++    if (registrationIt == m_state->registrations.end() || registrationIt->second != fd)
++        return std::unexpected("file descriptor source has been removed");
++    if (mask)
++        return std::unexpected("file descriptor sources are not supported on Windows");
++    return {};
++}
++
++void CEventLoopBackend::removeFD(uintptr_t sourceID, int fd) {
++    const auto registrationIt = m_state->registrations.find(sourceID);
++    if (registrationIt == m_state->registrations.end() || registrationIt->second != fd)
++        return;
++    m_state->registrations.erase(registrationIt);
++}
++
++std::expected<void, std::string> CEventLoopBackend::rearmFD(uintptr_t sourceID, int fd, FdEventMask mask) {
++    return {};
++}
++
++std::expected<void, std::string> CEventLoopBackend::armTimer(std::optional<std::chrono::steady_clock::time_point> deadline) {
++    if (!deadline) {
++        CancelWaitableTimer(m_state->timer);
++        return {};
++    }
++
++    auto remaining = *deadline - std::chrono::steady_clock::now();
++    if (remaining <= std::chrono::steady_clock::duration::zero())
++        remaining = std::chrono::nanoseconds{100};
++
++    // Negative due times are relative, in 100 ns units.
++    const auto    ticks = std::max<int64_t>(1, std::chrono::duration_cast<std::chrono::nanoseconds>(remaining).count() / 100);
++    LARGE_INTEGER due{};
++    due.QuadPart = -ticks;
++    if (!SetWaitableTimer(m_state->timer, &due, 0, nullptr, nullptr, FALSE))
++        return std::unexpected(systemError("SetWaitableTimer"));
++    return {};
++}
++
++void CEventLoopBackend::signalWake() {
++    SetEvent(m_state->wake);
++}
++
++std::expected<std::vector<SBackendEvent>, std::string> CEventLoopBackend::wait(int timeout, size_t maximumEvents) {
++    const HANDLE handles[] = {m_state->timer, m_state->wake};
++    const DWORD  waited    = WaitForMultipleObjects(2, handles, FALSE, timeout < 0 ? INFINITE : static_cast<DWORD>(timeout));
++    if (waited == WAIT_FAILED)
++        return std::unexpected(systemError("WaitForMultipleObjects"));
++
++    std::vector<SBackendEvent> result;
++    if (waited == WAIT_TIMEOUT || maximumEvents == 0)
++        return result;
++
++    // Report every signaled handle, as epoll would, not only the first.
++    if (waited == WAIT_OBJECT_0 || WaitForSingleObject(m_state->timer, 0) == WAIT_OBJECT_0)
++        result.push_back({.type = eBackendEventType::TIMER});
++    if (result.size() < maximumEvents && (waited == WAIT_OBJECT_0 + 1 || WaitForSingleObject(m_state->wake, 0) == WAIT_OBJECT_0))
++        result.push_back({.type = eBackendEventType::WAKE});
++    return result;
++}
++
++#endif
+diff --git a/src/math/Region.cpp b/src/math/Region.cpp
+index a75bf32..9ee3000 100644
+--- a/src/math/Region.cpp
++++ b/src/math/Region.cpp
+@@ -1,5 +1,6 @@
+ #include "hyprutils/memory/Casts.hpp"
+ #include <hyprutils/math/Region.hpp>
++#include <limits>
+ #include <cmath>
+ 
+ using namespace Hyprutils::Math;
+@@ -106,7 +107,7 @@ CRegion& Hyprutils::Math::CRegion::transform(const eTransform t, double w, doubl
+     clear();
+ 
+     for (auto& r : rects) {
+-        CBox xfmd{r.x1, r.y1, r.x2 - r.x1, r.y2 - r.y1};
++        CBox xfmd{static_cast<double>(r.x1), static_cast<double>(r.y1), static_cast<double>(r.x2 - r.x1), static_cast<double>(r.y2 - r.y1)};
+         xfmd.transform(t, w, h);
+         add(xfmd);
+     }
+@@ -191,7 +192,7 @@ Vector2D Hyprutils::Math::CRegion::closestPoint(const Vector2D& vec) const {
+     if (containsPoint(vec))
+         return vec;
+ 
+-    double   bestDist = __FLT_MAX__;
++    double   bestDist = std::numeric_limits<float>::max();
+     Vector2D leader   = vec;
+ 
+     for (auto& box : getRects()) {
+diff --git a/src/os/FileDescriptor.cpp b/src/os/FileDescriptor.cpp
+index f13a3ee..cb88464 100644
+--- a/src/os/FileDescriptor.cpp
++++ b/src/os/FileDescriptor.cpp
+@@ -1,9 +1,18 @@
+ #include <cstdlib>
+ #include <hyprutils/os/FileDescriptor.hpp>
++#include <utility>
++
++#ifdef _WIN32
++#ifndef WIN32_LEAN_AND_MEAN
++#define WIN32_LEAN_AND_MEAN
++#endif
++#include <windows.h>
++#include <io.h>
++#else
+ #include <fcntl.h>
+ #include <sys/poll.h>
+ #include <unistd.h>
+-#include <utility>
++#endif
+ 
+ using namespace Hyprutils::OS;
+ 
+@@ -33,11 +42,20 @@ int CFileDescriptor::get() const {
+ }
+ 
+ int CFileDescriptor::getFlags() const {
++#ifdef _WIN32
++    // CRT descriptors carry no FD_* flags; inheritance is chosen per CreateProcess call.
++    return m_fd == -1 ? -1 : 0;
++#else
+     return fcntl(m_fd, F_GETFD);
++#endif
+ }
+ 
+ bool CFileDescriptor::setFlags(int flags) {
++#ifdef _WIN32
++    return m_fd != -1;
++#else
+     return fcntl(m_fd, F_SETFD, flags) != -1;
++#endif
+ }
+ 
+ int CFileDescriptor::take() {
+@@ -46,7 +64,11 @@ int CFileDescriptor::take() {
+ 
+ void CFileDescriptor::reset() {
+     if (m_fd != -1) {
++#ifdef _WIN32
++        _close(m_fd);
++#else
+         close(m_fd);
++#endif
+         m_fd = -1;
+     }
+ }
+@@ -55,7 +77,11 @@ CFileDescriptor CFileDescriptor::duplicate(int flags) const {
+     if (m_fd == -1)
+         return {};
+ 
++#ifdef _WIN32
++    return CFileDescriptor{_dup(m_fd)};
++#else
+     return CFileDescriptor{fcntl(m_fd, flags, 0)};
++#endif
+ }
+ 
+ bool CFileDescriptor::isClosed() const {
+@@ -66,6 +92,33 @@ bool CFileDescriptor::isReadable() const {
+     return isReadable(m_fd);
+ }
+ 
++#ifdef _WIN32
++// Only pipes expose readiness without consuming data. Other descriptor types report
++// "open, not known readable", which matches how callers use these checks.
++static HANDLE osHandle(int fd) {
++    if (fd < 0)
++        return INVALID_HANDLE_VALUE;
++    return reinterpret_cast<HANDLE>(_get_osfhandle(fd));
++}
++
++bool CFileDescriptor::isClosed(int fd) {
++    const HANDLE handle = osHandle(fd);
++    if (handle == INVALID_HANDLE_VALUE)
++        return true;
++    if (GetFileType(handle) != FILE_TYPE_PIPE)
++        return false;
++    DWORD available = 0;
++    return !PeekNamedPipe(handle, nullptr, 0, nullptr, &available, nullptr) && GetLastError() == ERROR_BROKEN_PIPE;
++}
++
++bool CFileDescriptor::isReadable(int fd) {
++    const HANDLE handle = osHandle(fd);
++    if (handle == INVALID_HANDLE_VALUE || GetFileType(handle) != FILE_TYPE_PIPE)
++        return false;
++    DWORD available = 0;
++    return PeekNamedPipe(handle, nullptr, 0, nullptr, &available, nullptr) && available > 0;
++}
++#else
+ bool CFileDescriptor::isClosed(int fd) {
+     pollfd pfd = {
+         .fd      = fd,
+@@ -84,3 +137,4 @@ bool CFileDescriptor::isReadable(int fd) {
+ 
+     return poll(&pfd, 1, 0) > 0 && (pfd.revents & POLLIN);
+ }
++#endif
+diff --git a/src/os/ProcLock.cpp b/src/os/ProcLock.cpp
+index 03efc13..071608a 100644
+--- a/src/os/ProcLock.cpp
++++ b/src/os/ProcLock.cpp
+@@ -9,7 +9,18 @@
+ #include <optional>
+ #include <string>
+ #include <system_error>
++
++#ifdef _WIN32
++#ifndef WIN32_LEAN_AND_MEAN
++#define WIN32_LEAN_AND_MEAN
++#endif
++#include <windows.h>
++#include <process.h>
++#define getpid _getpid
++typedef int pid_t;
++#else
+ #include <unistd.h>
++#endif
+ #include <unordered_map>
+ #include <filesystem>
+ #include <fstream>
+@@ -33,6 +44,15 @@ static bool processAlive(pid_t pid) {
+     if (pid <= 0)
+         return false;
+ 
++#ifdef _WIN32
++    const HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, static_cast<DWORD>(pid));
++    if (!process)
++        return GetLastError() == ERROR_ACCESS_DENIED;
++    DWORD code = 0;
++    const bool alive = GetExitCodeProcess(process, &code) && code == STILL_ACTIVE;
++    CloseHandle(process);
++    return alive;
++#else
+     if (::kill(pid, 0) == 0)
+         return true;
+ 
+@@ -43,6 +63,7 @@ static bool processAlive(pid_t pid) {
+         return false;
+ 
+     return false;
++#endif
+ }
+ 
+ static uint32_t randomNumber() {
+@@ -64,8 +85,19 @@ CProcLock::~CProcLock() {
+ 
+ static std::optional<std::filesystem::path> getLocksDir() {
+     const auto XDG_RUNTIME_DIR = getenv("XDG_RUNTIME_DIR");
++#ifdef _WIN32
++    // Windows has no runtime dir; the per-user temp directory has the same lifetime/scope.
++    if (!XDG_RUNTIME_DIR || XDG_RUNTIME_DIR[0] == 0) {
++        std::error_code ec;
++        const auto      temp = std::filesystem::temp_directory_path(ec);
++        if (ec)
++            return std::nullopt;
++        return temp / "hypr" / LOCK_SUBDIR;
++    }
++#else
+     if (!XDG_RUNTIME_DIR || XDG_RUNTIME_DIR[0] == 0)
+         return std::nullopt;
++#endif
+ 
+     const std::string_view XDGRD = XDG_RUNTIME_DIR;
+ 
+diff --git a/src/os/Process.cpp b/src/os/Process.cpp
+index dd74a0c..26fc44d 100644
+--- a/src/os/Process.cpp
++++ b/src/os/Process.cpp
+@@ -1,3 +1,6 @@
++#ifndef _WIN32
++// Windows implementation: ProcessWin32.cpp
++
+ #include <hyprutils/os/Process.hpp>
+ #include <hyprutils/memory/Casts.hpp>
+ using namespace Hyprutils::OS;
+@@ -295,3 +298,5 @@ void Hyprutils::OS::CProcess::setStdoutFD(int fd) {
+ void Hyprutils::OS::CProcess::setStderrFD(int fd) {
+     m_impl->stderrFD = fd;
+ }
++
++#endif
+diff --git a/src/os/ProcessWin32.cpp b/src/os/ProcessWin32.cpp
+new file mode 100644
+index 0000000..1720505
+--- /dev/null
++++ b/src/os/ProcessWin32.cpp
+@@ -0,0 +1,256 @@
++#ifdef _WIN32
++
++#include <hyprutils/os/Process.hpp>
++
++#ifndef WIN32_LEAN_AND_MEAN
++#define WIN32_LEAN_AND_MEAN
++#endif
++#include <windows.h>
++#include <io.h>
++
++#include <algorithm>
++#include <array>
++#include <cwctype>
++#include <map>
++#include <thread>
++
++using namespace Hyprutils::OS;
++
++struct Hyprutils::OS::CProcess::impl {
++    std::string                                      binary, out, err;
++    std::vector<std::string>                         args;
++    std::vector<std::pair<std::string, std::string>> env;
++    pid_t                                            pid      = 0;
++    int                                              exitCode = 0, stdinFD = -1, stdoutFD = -1, stderrFD = -1;
++};
++
++struct SHandle {
++    HANDLE handle = nullptr;
++
++    SHandle() = default;
++    explicit SHandle(HANDLE h) : handle(h == INVALID_HANDLE_VALUE ? nullptr : h) {}
++    SHandle(const SHandle&)            = delete;
++    SHandle& operator=(const SHandle&) = delete;
++    ~SHandle() {
++        reset();
++    }
++    void reset(HANDLE h = nullptr) {
++        if (handle)
++            CloseHandle(handle);
++        handle = h;
++    }
++};
++
++static std::wstring wide(const std::string& text) {
++    if (text.empty())
++        return {};
++    const int    size = MultiByteToWideChar(CP_UTF8, 0, text.data(), static_cast<int>(text.size()), nullptr, 0);
++    std::wstring result(size, L'\0');
++    MultiByteToWideChar(CP_UTF8, 0, text.data(), static_cast<int>(text.size()), result.data(), size);
++    return result;
++}
++
++// Quotes one argument so CommandLineToArgvW / the MSVC CRT reproduce it exactly.
++static std::wstring quoteArgument(const std::wstring& argument) {
++    if (!argument.empty() && argument.find_first_of(L" \t\n\v\"") == std::wstring::npos)
++        return argument;
++
++    std::wstring result = L"\"";
++    for (size_t i = 0;; ++i) {
++        size_t backslashes = 0;
++        while (i < argument.size() && argument[i] == L'\\') {
++            ++i;
++            ++backslashes;
++        }
++
++        if (i == argument.size()) {
++            result.append(backslashes * 2, L'\\');
++            break;
++        }
++
++        if (argument[i] == L'"')
++            result.append(backslashes * 2 + 1, L'\\');
++        else
++            result.append(backslashes, L'\\');
++        result += argument[i];
++    }
++    return result + L'"';
++}
++
++static std::wstring commandLine(const std::string& binary, const std::vector<std::string>& args) {
++    std::wstring result = quoteArgument(wide(binary));
++    for (const auto& arg : args) {
++        result += L' ';
++        result += quoteArgument(wide(arg));
++    }
++    return result;
++}
++
++static std::wstring upper(std::wstring text) {
++    std::ranges::transform(text, text.begin(), [](wchar_t c) { return static_cast<wchar_t>(std::towupper(c)); });
++    return text;
++}
++
++// Environment names are case-insensitive on Windows; the block must be sorted that way.
++static std::wstring environmentBlock(const std::vector<std::pair<std::string, std::string>>& overrides) {
++    std::map<std::wstring, std::wstring> variables;
++    if (const auto block = GetEnvironmentStringsW()) {
++        for (auto entry = block; *entry; entry += wcslen(entry) + 1) {
++            const std::wstring_view text{entry};
++            const auto              equals = text.find(L'=', 1);
++            if (equals == std::wstring_view::npos)
++                continue;
++            const std::wstring name{text.substr(0, equals)};
++            variables[upper(name)] = std::wstring{text};
++        }
++        FreeEnvironmentStringsW(block);
++    }
++
++    for (const auto& [name, value] : overrides) {
++        const auto wideName      = wide(name);
++        variables[upper(wideName)] = wideName + L'=' + wide(value);
++    }
++
++    std::wstring result;
++    for (const auto& [_, entry] : variables) {
++        result += entry;
++        result += L'\0';
++    }
++    result += L'\0';
++    return result;
++}
++
++static std::string readAll(HANDLE pipe) {
++    std::string            result;
++    std::array<char, 4096> buffer{};
++    DWORD                  read = 0;
++    while (ReadFile(pipe, buffer.data(), static_cast<DWORD>(buffer.size()), &read, nullptr) && read > 0)
++        result.append(buffer.data(), read);
++    return result;
++}
++
++static HANDLE inheritableHandle(int fd) {
++    if (fd < 0)
++        return nullptr;
++    const auto handle = reinterpret_cast<HANDLE>(_get_osfhandle(fd));
++    if (handle == INVALID_HANDLE_VALUE)
++        return nullptr;
++    HANDLE duplicate = nullptr;
++    if (!DuplicateHandle(GetCurrentProcess(), handle, GetCurrentProcess(), &duplicate, 0, TRUE, DUPLICATE_SAME_ACCESS))
++        return nullptr;
++    return duplicate;
++}
++
++Hyprutils::OS::CProcess::CProcess(const std::string& binary, const std::vector<std::string>& args) : m_impl(new impl()) {
++    m_impl->binary = binary;
++    m_impl->args   = args;
++}
++
++Hyprutils::OS::CProcess::~CProcess() {
++    delete m_impl;
++}
++
++void Hyprutils::OS::CProcess::addEnv(const std::string& name, const std::string& value) {
++    m_impl->env.emplace_back(name, value);
++}
++
++bool Hyprutils::OS::CProcess::runSync() {
++    SECURITY_ATTRIBUTES security{sizeof(SECURITY_ATTRIBUTES), nullptr, TRUE};
++    HANDLE              outRead = nullptr, outWrite = nullptr, errRead = nullptr, errWrite = nullptr;
++    if (!CreatePipe(&outRead, &outWrite, &security, 0))
++        return false;
++    SHandle stdoutRead{outRead}, stdoutWrite{outWrite};
++    if (!CreatePipe(&errRead, &errWrite, &security, 0))
++        return false;
++    SHandle stderrRead{errRead}, stderrWrite{errWrite};
++    // Only the child ends are inherited.
++    SetHandleInformation(stdoutRead.handle, HANDLE_FLAG_INHERIT, 0);
++    SetHandleInformation(stderrRead.handle, HANDLE_FLAG_INHERIT, 0);
++
++    STARTUPINFOW startup{};
++    startup.cb         = sizeof(startup);
++    startup.dwFlags    = STARTF_USESTDHANDLES;
++    startup.hStdInput  = GetStdHandle(STD_INPUT_HANDLE);
++    startup.hStdOutput = stdoutWrite.handle;
++    startup.hStdError  = stderrWrite.handle;
++
++    auto                command     = commandLine(m_impl->binary, m_impl->args);
++    auto                environment = environmentBlock(m_impl->env);
++    PROCESS_INFORMATION info{};
++    if (!CreateProcessW(nullptr, command.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT, environment.data(), nullptr, &startup, &info))
++        return false;
++
++    SHandle process{info.hProcess}, thread{info.hThread};
++    m_impl->pid = static_cast<pid_t>(info.dwProcessId);
++    stdoutWrite.reset();
++    stderrWrite.reset();
++
++    // Drain both pipes concurrently so a full stderr buffer cannot block stdout.
++    std::string errors;
++    std::thread errorReader([&errors, handle = stderrRead.handle] { errors = readAll(handle); });
++    m_impl->out = readAll(stdoutRead.handle);
++    errorReader.join();
++    m_impl->err = std::move(errors);
++
++    WaitForSingleObject(process.handle, INFINITE);
++    DWORD code = 0;
++    GetExitCodeProcess(process.handle, &code);
++    m_impl->exitCode = static_cast<int>(code);
++    return true;
++}
++
++bool Hyprutils::OS::CProcess::runAsync() {
++    SHandle      input{inheritableHandle(m_impl->stdinFD)}, output{inheritableHandle(m_impl->stdoutFD)}, error{inheritableHandle(m_impl->stderrFD)};
++    STARTUPINFOW startup{};
++    startup.cb = sizeof(startup);
++    const bool redirect = input.handle || output.handle || error.handle;
++    if (redirect) {
++        startup.dwFlags    = STARTF_USESTDHANDLES;
++        startup.hStdInput  = input.handle ? input.handle : GetStdHandle(STD_INPUT_HANDLE);
++        startup.hStdOutput = output.handle ? output.handle : GetStdHandle(STD_OUTPUT_HANDLE);
++        startup.hStdError  = error.handle ? error.handle : GetStdHandle(STD_ERROR_HANDLE);
++    }
++
++    auto                command     = commandLine(m_impl->binary, m_impl->args);
++    auto                environment = environmentBlock(m_impl->env);
++    PROCESS_INFORMATION info{};
++    if (!CreateProcessW(nullptr, command.data(), nullptr, nullptr, redirect, CREATE_UNICODE_ENVIRONMENT | DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP, environment.data(),
++                        nullptr, &startup, &info))
++        return false;
++
++    // Detached: the process outlives this object, as with the POSIX double fork.
++    CloseHandle(info.hThread);
++    CloseHandle(info.hProcess);
++    m_impl->pid = static_cast<pid_t>(info.dwProcessId);
++    return true;
++}
++
++const std::string& Hyprutils::OS::CProcess::stdOut() {
++    return m_impl->out;
++}
++
++const std::string& Hyprutils::OS::CProcess::stdErr() {
++    return m_impl->err;
++}
++
++pid_t Hyprutils::OS::CProcess::pid() {
++    return m_impl->pid;
++}
++
++int Hyprutils::OS::CProcess::exitCode() {
++    return m_impl->exitCode;
++}
++
++void Hyprutils::OS::CProcess::setStdinFD(int fd) {
++    m_impl->stdinFD = fd;
++}
++
++void Hyprutils::OS::CProcess::setStdoutFD(int fd) {
++    m_impl->stdoutFD = fd;
++}
++
++void Hyprutils::OS::CProcess::setStderrFD(int fd) {
++    m_impl->stderrFD = fd;
++}
++
++#endif
+diff --git a/src/os/Semaphore.cpp b/src/os/Semaphore.cpp
+index 6877741..2e2b224 100644
+--- a/src/os/Semaphore.cpp
++++ b/src/os/Semaphore.cpp
+@@ -1,17 +1,46 @@
+ #include <hyprutils/os/Semaphore.hpp>
+ 
++#include <format>
++
++#ifdef _WIN32
++#ifndef WIN32_LEAN_AND_MEAN
++#define WIN32_LEAN_AND_MEAN
++#endif
++#include <windows.h>
++#else
+ #include <cerrno>
+ #include <fcntl.h>
+ #include <sys/file.h>
+ #include <sys/mman.h>
+ #include <sys/stat.h>
+ #include <unistd.h>
+-
+-#include <format>
++#endif
+ 
+ using namespace Hyprutils;
+ using namespace Hyprutils::OS;
+ 
++#ifdef _WIN32
++// A session-local named mutex gives the same scoped, cross-process exclusion as flock.
++CSemaphore::CSemaphore(const char* name) {
++    const auto mutexName = std::format("Local\\hu_{}", name);
++    m_handle             = CreateMutexA(nullptr, FALSE, mutexName.c_str());
++    if (!m_handle)
++        return;
++
++    const auto waited = WaitForSingleObject(m_handle, INFINITE);
++    if (waited != WAIT_OBJECT_0 && waited != WAIT_ABANDONED) {
++        CloseHandle(m_handle);
++        m_handle = nullptr;
++    }
++}
++
++CSemaphore::~CSemaphore() {
++    if (!m_handle)
++        return;
++    ReleaseMutex(m_handle);
++    CloseHandle(m_handle);
++}
++#else
+ CSemaphore::CSemaphore(const char* name) {
+     m_fd = shm_open(std::format("/hu_{}", name).c_str(), O_CREAT | O_RDWR | O_CLOEXEC, 0600);
+ 
+@@ -31,3 +60,4 @@ CSemaphore::~CSemaphore() {
+     if (m_fd != -1)
+         close(m_fd);
+ }
++#endif
+diff --git a/src/path/Path.cpp b/src/path/Path.cpp
+index ae8fa99..d1504f5 100644
+--- a/src/path/Path.cpp
++++ b/src/path/Path.cpp
+@@ -6,6 +6,22 @@
+ using namespace Hyprutils;
+ 
+ namespace Hyprutils::Path {
++    // Windows sets USERPROFILE rather than HOME unless a POSIX environment exported it.
++    static const char* homeDirectory() {
++        const auto home = getenv("HOME");
++#ifdef _WIN32
++        if (!home || !home[0])
++            return getenv("USERPROFILE");
++#endif
++        return home;
++    }
++
++#ifdef _WIN32
++    constexpr char PATH_LIST_SEPARATOR = ';';
++#else
++    constexpr char PATH_LIST_SEPARATOR = ':';
++#endif
++
+     std::string fullConfigPath(std::string basePath, std::string programName) {
+         return basePath + "/hypr/" + programName + ".conf";
+     }
+@@ -23,7 +39,7 @@ namespace Hyprutils::Path {
+     }
+ 
+     std::optional<std::string> getHome() {
+-        static const auto homeDir = getenv("HOME");
++        static const auto homeDir = homeDirectory();
+ 
+         if (!homeDir || !std::filesystem::path(homeDir).is_absolute())
+             return std::nullopt;
+@@ -37,7 +53,7 @@ namespace Hyprutils::Path {
+         if (!xdgConfigDirs)
+             return std::nullopt;
+ 
+-        static const auto xdgConfigDirsList = String::CVarList(xdgConfigDirs, 0, ':');
++        static const auto xdgConfigDirsList = String::CVarList(xdgConfigDirs, 0, PATH_LIST_SEPARATOR);
+ 
+         return xdgConfigDirsList;
+     }
+@@ -100,25 +116,30 @@ namespace Hyprutils::Path {
+ 
+         // Expand leading ~ to the home directory
+         if (path[0] == '~') {
+-            const auto homeDir = getenv("HOME");
++            const auto homeDir = homeDirectory();
+             if (!homeDir)
+                 return std::unexpected("HOME environment variable not set");
+ 
+             std::string expanded(homeDir);
+             if (path.size() > 1) {
++#ifdef _WIN32
++                if (path[1] != '/' && path[1] != '\\')
++#else
+                 if (path[1] != '/')
++#endif
+                     return std::unexpected("invalid path: ~ must be followed by / or end of path");
+                 expanded.append(path.substr(1));
+             }
+             p = std::filesystem::path(expanded);
+         }
+ 
+-        // If still relative, anchor to base (or cwd)
+-        if (p.is_relative()) {
++        // If still relative, anchor to base (or cwd). On Windows "/x" has a root directory
++        // but no drive; it already names a location on the current drive, so keep it.
++        if (p.is_relative() && !p.has_root_directory()) {
+             std::filesystem::path baseP;
+             if (!base.empty()) {
+                 baseP = std::filesystem::path(base);
+-                if (baseP.is_relative()) {
++                if (baseP.is_relative() && !baseP.has_root_directory()) {
+                     std::error_code ec;
+                     auto            cwd = std::filesystem::current_path(ec);
+                     if (ec)
+@@ -137,6 +158,7 @@ namespace Hyprutils::Path {
+         // Lexically normalise (resolves . and .. without hitting the filesystem)
+         p = p.lexically_normal();
+ 
+-        return p.string();
++        // Config paths use '/'; Windows accepts it, so report one separator style everywhere.
++        return p.generic_string();
+     }
+ }
+diff --git a/tests/path/Path.cpp b/tests/path/Path.cpp
+index 0900ba2..f0d853b 100644
+--- a/tests/path/Path.cpp
++++ b/tests/path/Path.cpp
+@@ -6,12 +6,16 @@
+ using namespace Hyprutils::Path;
+ 
+ static std::string cwd() {
+-    return std::filesystem::current_path().string();
++    return std::filesystem::current_path().generic_string();
+ }
+ 
+ static std::string home() {
+     const char* h = getenv("HOME");
+-    return h ? std::string(h) : std::string{};
++#ifdef _WIN32
++    if (!h || !h[0])
++        h = getenv("USERPROFILE");
++#endif
++    return h ? std::filesystem::path(h).generic_string() : std::string{};
+ }
+ 
+ TEST(Path, resolvePath_absolute) {
+diff --git a/tests/win32/Win32.cpp b/tests/win32/Win32.cpp
+new file mode 100644
+index 0000000..5e2e44d
+--- /dev/null
++++ b/tests/win32/Win32.cpp
+@@ -0,0 +1,190 @@
++#ifdef _WIN32
++
++#include <hyprutils/eventLoop/EventLoop.hpp>
++#include <hyprutils/os/FileDescriptor.hpp>
++#include <hyprutils/os/ProcLock.hpp>
++#include <hyprutils/os/Process.hpp>
++#include <hyprutils/os/Semaphore.hpp>
++
++#ifndef WIN32_LEAN_AND_MEAN
++#define WIN32_LEAN_AND_MEAN
++#endif
++#include <windows.h>
++#include <fcntl.h>
++#include <io.h>
++
++#include <atomic>
++#include <chrono>
++#include <cstdlib>
++#include <filesystem>
++#include <iostream>
++#include <thread>
++
++#include <gtest/gtest.h>
++
++using namespace Hyprutils::OS;
++using namespace Hyprutils::EventLoop;
++using namespace std::chrono_literals;
++
++// The test binary doubles as a child process: with HU_ECHO_ARGS set it prints each
++// argument on its own line, so quoting can be checked against the real CRT parser.
++static const bool s_echoChild = [] {
++    char*  value = nullptr;
++    size_t size  = 0;
++    if (_dupenv_s(&value, &size, "HU_ECHO_ARGS") != 0 || !value)
++        return false;
++    const bool echo = std::string_view(value) == "1";
++    free(value);
++    if (!echo)
++        return false;
++    for (int i = 1; i < __argc; ++i)
++        std::cout << "[" << __argv[i] << "]\n";
++    std::cerr << "stderr-line\n";
++    std::cout.flush();
++    std::exit(7);
++}();
++
++static std::string selfPath() {
++    char path[MAX_PATH]{};
++    GetModuleFileNameA(nullptr, path, MAX_PATH);
++    return path;
++}
++
++TEST(Win32, ProcessSyncQuotingEnvAndExitCode) {
++    CProcess process(selfPath(), {"plain", "with space", "quote\"inside", "trailing\\", "back\\\\slashes", ""});
++    process.addEnv("HU_ECHO_ARGS", "1");
++    ASSERT_TRUE(process.runSync());
++    EXPECT_EQ(process.stdOut(), "[plain]\r\n[with space]\r\n[quote\"inside]\r\n[trailing\\]\r\n[back\\\\slashes]\r\n[]\r\n");
++    EXPECT_EQ(process.stdErr(), "stderr-line\r\n");
++    EXPECT_EQ(process.exitCode(), 7);
++    EXPECT_GT(process.pid(), 0);
++}
++
++TEST(Win32, ProcessMissingBinaryFails) {
++    CProcess process("hyprutils-definitely-missing-binary.exe", {});
++    EXPECT_FALSE(process.runSync());
++}
++
++TEST(Win32, ProcessAsyncRedirectsStdout) {
++    int pipes[2] = {-1, -1};
++    ASSERT_EQ(_pipe(pipes, 4096, _O_BINARY | _O_NOINHERIT), 0);
++    CFileDescriptor readEnd{pipes[0]}, writeEnd{pipes[1]};
++
++    CProcess        process(selfPath(), {"async"});
++    process.addEnv("HU_ECHO_ARGS", "1");
++    process.setStdoutFD(writeEnd.get());
++    ASSERT_TRUE(process.runAsync());
++    writeEnd.reset();
++
++    std::string output;
++    char        buffer[256];
++    int         read = 0;
++    while ((read = _read(readEnd.get(), buffer, sizeof(buffer))) > 0)
++        output.append(buffer, read);
++    EXPECT_EQ(output, "[async]\r\n");
++}
++
++TEST(Win32, FileDescriptorPipeState) {
++    int pipes[2] = {-1, -1};
++    ASSERT_EQ(_pipe(pipes, 4096, _O_BINARY), 0);
++    CFileDescriptor readEnd{pipes[0]}, writeEnd{pipes[1]};
++
++    EXPECT_TRUE(readEnd.isValid());
++    EXPECT_EQ(readEnd.getFlags(), 0);
++    EXPECT_FALSE(readEnd.isReadable());
++    EXPECT_FALSE(readEnd.isClosed());
++
++    ASSERT_EQ(_write(writeEnd.get(), "x", 1), 1);
++    EXPECT_TRUE(readEnd.isReadable());
++
++    auto duplicate = readEnd.duplicate();
++    EXPECT_TRUE(duplicate.isValid());
++    EXPECT_NE(duplicate.get(), readEnd.get());
++
++    writeEnd.reset();
++    EXPECT_FALSE(writeEnd.isValid());
++    char byte = 0;
++    ASSERT_EQ(_read(readEnd.get(), &byte, 1), 1);
++    EXPECT_TRUE(readEnd.isClosed());
++
++    const int raw = readEnd.take();
++    EXPECT_FALSE(readEnd.isValid());
++    EXPECT_EQ(_close(raw), 0);
++}
++
++TEST(Win32, SemaphoreExcludesOtherThreads) {
++    std::atomic<bool> released = false, acquired = false;
++    std::thread       contender;
++    {
++        CSemaphore lock("win32_test");
++        contender = std::thread([&] {
++            CSemaphore other("win32_test");
++            acquired = true;
++            EXPECT_TRUE(released.load());
++        });
++        std::this_thread::sleep_for(100ms);
++        EXPECT_FALSE(acquired.load());
++        released = true;
++    }
++    contender.join();
++    EXPECT_TRUE(acquired.load());
++}
++
++TEST(Win32, ProcLockExclusiveAndRelease) {
++    const auto instance = "hu-win32-test-" + std::to_string(GetCurrentProcessId());
++    {
++        CProcLock first(std::string(instance), {{"display", "a"}});
++        ASSERT_TRUE(first.obtain(CProcLock::eProcLockFlags::EXCLUSIVE).has_value());
++        EXPECT_EQ(first.enumerate().size(), 1);
++
++        CProcLock same(std::string(instance), {{"display", "a"}});
++        const auto result = same.obtain(CProcLock::eProcLockFlags::EXCLUSIVE);
++        ASSERT_FALSE(result.has_value());
++        EXPECT_EQ(result.error(), CProcLock::eProcLockObtainingError::ALREADY_RUNNING);
++
++        CProcLock otherDisplay(std::string(instance), {{"display", "b"}});
++        EXPECT_TRUE(otherDisplay.obtain(CProcLock::eProcLockFlags::EXCLUSIVE).has_value());
++        EXPECT_EQ(first.enumerate().size(), 2);
++    }
++    CProcLock probe(std::string(instance), {});
++    EXPECT_TRUE(probe.enumerate().empty());
++}
++
++TEST(Win32, EventLoopTimersAndExecutor) {
++    auto loop = IEventLoop::create();
++    ASSERT_TRUE(loop.has_value());
++    EXPECT_EQ((*loop)->fd(), -1);
++
++    int  fired = 0;
++    auto timer = (*loop)->addTimer(20ms, [&](ITimer&) {
++        ++fired;
++        (*loop)->stop();
++    });
++
++    const auto start = std::chrono::steady_clock::now();
++    ASSERT_TRUE((*loop)->enterLoop().has_value());
++    EXPECT_EQ(fired, 1);
++    EXPECT_GE(std::chrono::steady_clock::now() - start, 15ms);
++
++    bool posted   = false;
++    auto executor = (*loop)->executor();
++    std::thread([executor] { executor->post([] {}); }).join();
++    executor->post([&] {
++        posted = true;
++        (*loop)->stop();
++    });
++    ASSERT_TRUE((*loop)->enterLoop().has_value());
++    EXPECT_TRUE(posted);
++}
++
++TEST(Win32, EventLoopRejectsFdSources) {
++    auto loop = IEventLoop::create();
++    ASSERT_TRUE(loop.has_value());
++    int pipes[2] = {-1, -1};
++    ASSERT_EQ(_pipe(pipes, 64, _O_BINARY), 0);
++    CFileDescriptor writeEnd{pipes[1]};
++    auto            source = (*loop)->addFD(CFileDescriptor{pipes[0]}, eEventMask::READABLE, [](IFDSource&, FdEventMask) {});
++    EXPECT_FALSE(source.has_value());
++}
++
++#endif

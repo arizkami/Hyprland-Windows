@@ -1,6 +1,7 @@
 #pragma once
 
 #include "../helpers/memory/Memory.hpp"
+#include <optional>
 #include "../helpers/math/Math.hpp"
 #include "../desktop/DesktopTypes.hpp"
 

@@ -291,7 +291,7 @@ void CLayoutManager::performSnap(Vector2D& sourcePos, Vector2D& sourceSize, SP<I
         const auto   MON        = DRAGGINGWINDOW->m_monitor.lock();
 
         const auto*  GAPSOUT   = *SNAPRESPECTGAPS ? sc<Config::CCssGapData*>(PGAPSOUT.ptr()) : &GAPSNONE;
-        const auto   WORK_AREA = Desktop::CReservedArea{GAPSOUT->m_top, GAPSOUT->m_right, GAPSOUT->m_bottom, GAPSOUT->m_left}.apply(MON->logicalBoxMinusReserved());
+        const auto   WORK_AREA = Desktop::CReservedArea(GAPSOUT->m_top, GAPSOUT->m_right, GAPSOUT->m_bottom, GAPSOUT->m_left).apply(MON->logicalBoxMinusReserved());
 
         SRange       monX = {WORK_AREA.x, WORK_AREA.x + WORK_AREA.w};
         SRange       monY = {WORK_AREA.y, WORK_AREA.y + WORK_AREA.h};

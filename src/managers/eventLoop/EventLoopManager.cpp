@@ -8,7 +8,11 @@
 #include <limits>
 #include <ranges>
 
+#ifdef _WIN32
+#include "../../../windows/platform/win32/MessagePump.hpp"
+#else
 #include <sys/timerfd.h>
+#endif
 #include <ctime>
 
 #include <aquamarine/backend/Backend.hpp>
@@ -28,7 +32,9 @@ SEventLoopDoLaterLock::~SEventLoopDoLaterLock() {
 }
 
 CEventLoopManager::CEventLoopManager(wl_display* display, wl_event_loop* wlEventLoop) {
-    m_timers.timerfd  = CFileDescriptor{timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC)};
+#ifndef _WIN32
+    m_timers.timerfd = CFileDescriptor{timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC)};
+#endif
     m_wayland.loop    = wlEventLoop;
     m_wayland.display = display;
 }
@@ -46,8 +52,26 @@ CEventLoopManager::~CEventLoopManager() {
         wl_event_source_remove(m_idle.eventSource);
     if (m_configWatcherInotifySource)
         wl_event_source_remove(m_configWatcherInotifySource);
+#ifdef _WIN32
+    if (m_timers.source)
+        wl_event_source_remove(m_timers.source);
+    if (m_messageSource)
+        wl_event_source_remove(m_messageSource);
+#endif
 }
 
+#ifdef _WIN32
+static int timerFire(void* data) {
+    g_pEventLoopManager->onTimerFire();
+    return 0;
+}
+
+static int aquamarineHandleSignaled(void* handle, void* data) {
+    sc<Aquamarine::SPollFD*>(data)->onSignal();
+    return 0;
+}
+
+#else
 static int timerWrite(int fd, uint32_t mask, void* data) {
     if (!CFileDescriptor::isReadable(fd))
         LOG(Log::ERR, "timerWrite: triggered a non readable event on fd : {}", fd);
@@ -60,6 +84,7 @@ static int timerWrite(int fd, uint32_t mask, void* data) {
     g_pEventLoopManager->onTimerFire();
     return 0;
 }
+#endif
 
 static int aquamarineFDWrite(int fd, uint32_t mask, void* data) {
     auto POLLFD = sc<Aquamarine::SPollFD*>(data);
@@ -122,10 +147,27 @@ void CEventLoopManager::onFdReadableFail(SReadableWaiter* waiter) {
 }
 
 void CEventLoopManager::enterLoop() {
+#ifdef _WIN32
+    m_timers.source = wl_event_loop_add_timer(m_wayland.loop, timerFire, nullptr);
+    m_messageSource = wl_event_loop_add_win32_messages(m_wayland.loop, WindowsPlatform::pumpThreadMessages, nullptr);
+    nudgeTimers();
+#else
     m_wayland.eventSource = wl_event_loop_add_fd(m_wayland.loop, m_timers.timerfd.get(), WL_EVENT_READABLE, timerWrite, nullptr);
+#endif
 
+#ifdef _WIN32
+    if (const auto CHANGE_HANDLE = Config::watcher()->getChangeHandle(); CHANGE_HANDLE)
+        m_configWatcherInotifySource = wl_event_loop_add_handle(
+            m_wayland.loop, CHANGE_HANDLE,
+            [](void*, void*) -> int {
+                Config::watcher()->onInotifyEvent();
+                return 0;
+            },
+            nullptr);
+#else
     if (const auto& FD = Config::watcher()->getInotifyFD(); FD.isValid())
         m_configWatcherInotifySource = wl_event_loop_add_fd(m_wayland.loop, FD.get(), WL_EVENT_READABLE, configWatcherWrite, nullptr);
+#endif
 
     syncPollFDs();
     m_listeners.pollFDsChanged = g_pCompositor->m_aqBackend->events.pollFDsChanged.listen([this] { syncPollFDs(); });
@@ -203,6 +245,11 @@ void CEventLoopManager::nudgeTimers() {
 
     nextTimerUs = std::clamp(nextTimerUs + 1, 1L, std::numeric_limits<long>::max());
 
+#ifdef _WIN32
+    // wl_event_loop timers take milliseconds; round up so timers never fire early.
+    if (m_timers.source)
+        wl_event_source_timer_update(m_timers.source, sc<int>(std::min<long>((nextTimerUs + 999) / 1000, std::numeric_limits<int>::max())));
+#else
     timespec now;
     clock_gettime(CLOCK_MONOTONIC, &now);
     timespecAddNs(&now, nextTimerUs * 1000L);
@@ -210,6 +257,7 @@ void CEventLoopManager::nudgeTimers() {
     itimerspec ts = {.it_value = now};
 
     timerfd_settime(m_timers.timerfd.get(), TFD_TIMER_ABSTIME, &ts, nullptr);
+#endif
 }
 
 uint64_t CEventLoopManager::doLater(const std::function<void()>& fn) {
@@ -251,6 +299,11 @@ UP<SEventLoopDoLaterLock> CEventLoopManager::doLaterLock(const std::function<voi
 }
 
 WP<SReadableWaiter> CEventLoopManager::doOnReadable(CFileDescriptor fd, std::function<void()>&& fn) {
+#ifdef _WIN32
+    // The descriptors waited on here are DRM sync files, which Windows never produces.
+    fn();
+    return nullptr;
+#else
     if (!fd.isValid() || fd.isReadable()) {
         fn();
         return nullptr;
@@ -260,6 +313,7 @@ WP<SReadableWaiter> CEventLoopManager::doOnReadable(CFileDescriptor fd, std::fun
     waiter->source = wl_event_loop_add_fd(g_pEventLoopManager->m_wayland.loop, waiter->fd.get(), WL_EVENT_READABLE, ::handleWaiterFD, waiter.get());
 
     return waiter;
+#endif
 }
 
 void CEventLoopManager::removeReadableWaiter(const WP<SReadableWaiter>& waiter) {
@@ -270,6 +324,16 @@ void CEventLoopManager::removeReadableWaiter(const WP<SReadableWaiter>& waiter) 
     std::erase_if(m_readableWaiters, [&waiter](const UP<SReadableWaiter>& w) { return waiter == w; });
 }
 
+#ifdef _WIN32
+static void* pollKey(const SP<Aquamarine::SPollFD>& fd) {
+    return fd->handle;
+}
+#else
+static int pollKey(const SP<Aquamarine::SPollFD>& fd) {
+    return fd->fd;
+}
+#endif
+
 void CEventLoopManager::syncPollFDs() {
     auto aqPollFDs = g_pCompositor->m_aqBackend->getPollFDs();
 
@@ -277,7 +341,7 @@ void CEventLoopManager::syncPollFDs() {
         auto const& [fd, eventSourceData] = item;
 
         // If no pollFD has the same fd, remove this event source
-        const bool shouldRemove = std::ranges::none_of(aqPollFDs, [&](const auto& pollFD) { return pollFD->fd == fd; });
+        const bool shouldRemove = std::ranges::none_of(aqPollFDs, [&](const auto& pollFD) { return pollKey(pollFD) == fd; });
 
         if (shouldRemove)
             wl_event_source_remove(eventSourceData.eventSource);
@@ -285,8 +349,12 @@ void CEventLoopManager::syncPollFDs() {
         return shouldRemove;
     });
 
-    for (auto& fd : aqPollFDs | std::views::filter([&](SP<Aquamarine::SPollFD> fd) { return !m_aqEventSources.contains(fd->fd); })) {
-        auto eventSource         = wl_event_loop_add_fd(m_wayland.loop, fd->fd, WL_EVENT_READABLE, aquamarineFDWrite, fd.get());
-        m_aqEventSources[fd->fd] = {.pollFD = fd, .eventSource = eventSource};
+    for (auto& fd : aqPollFDs | std::views::filter([&](SP<Aquamarine::SPollFD> fd) { return !m_aqEventSources.contains(pollKey(fd)); })) {
+#ifdef _WIN32
+        auto eventSource = wl_event_loop_add_handle(m_wayland.loop, fd->handle, aquamarineHandleSignaled, fd.get());
+#else
+        auto eventSource = wl_event_loop_add_fd(m_wayland.loop, fd->fd, WL_EVENT_READABLE, aquamarineFDWrite, fd.get());
+#endif
+        m_aqEventSources[pollKey(fd)] = {.pollFD = fd, .eventSource = eventSource};
     }
 }

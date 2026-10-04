@@ -41,7 +41,7 @@ CTextInputV1::CTextInputV1(SP<CZwpTextInputV1> resource_) : m_resource(resource_
                                 purpose > sc<uint32_t>(ZWP_TEXT_INPUT_V1_CONTENT_PURPOSE_PASSWORD) ? hint + 1 : hint};
     });
 
-    m_resource->setSetCursorRectangle([this](CZwpTextInputV1* pMgr, int32_t x, int32_t y, int32_t width, int32_t height) { m_cursorRectangle = CBox{x, y, width, height}; });
+    m_resource->setSetCursorRectangle([this](CZwpTextInputV1* pMgr, int32_t x, int32_t y, int32_t width, int32_t height) { m_cursorRectangle = CBox(x, y, width, height); });
 
     m_resource->setCommitState([this](CZwpTextInputV1* pMgr, uint32_t serial_) {
         m_serial = serial_;

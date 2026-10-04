@@ -2,7 +2,8 @@ cmake_minimum_required(VERSION 3.30)
 
 # Select the native platform before any Linux generators or package discovery.
 if(WIN32)
-  project(HyprlandWindowsPlatform LANGUAGES CXX)
+  include(${CMAKE_CURRENT_LIST_DIR}/windows/cmake/Vcpkg.cmake)
+  project(HyprlandWindowsPlatform LANGUAGES C CXX)
   include(CTest)
   add_subdirectory(windows)
   return()

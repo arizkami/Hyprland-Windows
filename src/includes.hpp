@@ -6,15 +6,17 @@
 #pragma diag_suppress 1696
 #endif
 
+#ifndef _WIN32
 #include <getopt.h>
 #include <libinput.h>
 #include <linux/input-event-codes.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#endif
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
-#include <sys/wait.h>
 #include <ctime>
-#include <unistd.h>
 #include <wayland-server-core.h>
 
 #define GLES32

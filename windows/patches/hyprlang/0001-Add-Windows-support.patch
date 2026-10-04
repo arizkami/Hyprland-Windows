@@ -1,0 +1,74 @@
+diff --git a/src/config.cpp b/src/config.cpp
+index 6c95093..29e5dcf 100644
+--- a/src/config.cpp
++++ b/src/config.cpp
+@@ -22,6 +22,10 @@ using namespace Hyprutils::String;
+ #ifdef __APPLE__
+ #include <crt_externs.h>
+ #define environ (*_NSGetEnviron())
++#elif defined(_WIN32)
++// The MSVC CRT exposes the narrow environment block as _environ.
++#include <cstdlib>
++#define environ _environ
+ #else
+ // NOLINTNEXTLINE
+ extern "C" char** environ;
+@@ -953,7 +957,7 @@ CParseResult CConfig::parse() {
+             return res;
+         }
+ 
+-        std::string canonical = std::filesystem::canonical(impl->path);
++        std::string canonical = std::filesystem::canonical(impl->path).string();
+ 
+         fileParseResult = parseFile(canonical.c_str());
+     } else {
+diff --git a/src/config.hpp b/src/config.hpp
+index 91c2522..8bf4a6d 100644
+--- a/src/config.hpp
++++ b/src/config.hpp
+@@ -5,6 +5,7 @@
+ #include <vector>
+ #include <memory>
+ #include <expected>
++#include <optional>
+ 
+ struct SHandler {
+     std::string                  name = "";
+diff --git a/tests/parse/main.cpp b/tests/parse/main.cpp
+index 3ac57ee..171460b 100644
+--- a/tests/parse/main.cpp
++++ b/tests/parse/main.cpp
+@@ -4,6 +4,15 @@
+ 
+ #include <hyprlang.hpp>
+ 
++#ifdef _WIN32
++#include <cstdlib>
++static int setenv(const char* name, const char* value, int overwrite) {
++    if (!overwrite && getenv(name))
++        return 0;
++    return _putenv_s(name, value);
++}
++#endif
++
+ namespace Colors {
+     constexpr const char* RED     = "\x1b[31m";
+     constexpr const char* GREEN   = "\x1b[32m";
+@@ -72,7 +81,7 @@ static Hyprlang::CParseResult handleNoop(const char* COMMAND, const char* VALUE)
+ }
+ 
+ static Hyprlang::CParseResult handleSource(const char* COMMAND, const char* VALUE) {
+-    std::string PATH = std::filesystem::canonical(currentPath + "/" + VALUE);
++    std::string PATH = std::filesystem::canonical(currentPath + "/" + VALUE).string();
+     return pConfig->parseFile(PATH.c_str());
+ }
+ 
+@@ -120,7 +129,7 @@ int main(int argc, char** argv, char** envp) {
+ 
+         Hyprlang::CConfig config("./config/config.conf", {});
+         pConfig     = &config;
+-        currentPath = std::filesystem::canonical("./config/");
++        currentPath = std::filesystem::canonical("./config/").string();
+ 
+         // setup config
+         config.addConfigValue("testInt", (Hyprlang::INT)0);

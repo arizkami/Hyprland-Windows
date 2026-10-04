@@ -1,3 +1,10 @@
+if(WIN32)
+    # The root Windows branch creates the native client with its shared transport.
+    if(NOT TARGET hyprctl)
+        message(FATAL_ERROR "Build the native hyprctl target from the repository root or windows folder")
+    endif()
+    return()
+endif()
 cmake_minimum_required(VERSION 3.19)
 
 project(

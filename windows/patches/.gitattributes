@@ -1,0 +1,2 @@
+# Patches apply to LF upstream sources; never convert them to CRLF.
+*.patch -text

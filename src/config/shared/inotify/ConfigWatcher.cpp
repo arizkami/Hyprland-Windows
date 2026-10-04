@@ -2,13 +2,17 @@
 #if defined(__linux__)
 #include <linux/limits.h>
 #endif
+#ifndef _WIN32
 #include <sys/inotify.h>
+#endif
 #include "../../../debug/log/Logger.hpp"
 #include "../../ConfigValue.hpp"
 #include "../../ConfigManager.hpp"
 #include <ranges>
-#include <unistd.h>
 #include <filesystem>
+#ifndef _WIN32
+#include <unistd.h>
+#endif
 
 using namespace Hyprutils::OS;
 using namespace Config;
@@ -18,12 +22,17 @@ UP<CConfigWatcher>& Config::watcher() {
     return p;
 }
 
+// Windows: constructor, setWatchList and onInotifyEvent live in
+// windows/platform/win32/ConfigWatcher.cpp.
+#ifndef _WIN32
 CConfigWatcher::CConfigWatcher() : m_inotifyFd(inotify_init1(IN_NONBLOCK | IN_CLOEXEC)) {
     if (!m_inotifyFd.isValid()) {
         LOG(Log::ERR, "CConfigWatcher couldn't open an inotify node. Config will not be automatically reloaded");
         return;
     }
 }
+
+#endif
 
 CFileDescriptor& CConfigWatcher::getInotifyFD() {
     return m_inotifyFd;
@@ -34,6 +43,11 @@ void CConfigWatcher::update() {
     setWatchList(*PDISABLEAUTORELOAD ? std::vector<std::string>{} : Config::mgr()->getConfigPaths());
 }
 
+void CConfigWatcher::setOnChange(const std::function<void(const SConfigWatchEvent&)>& fn) {
+    m_watchCallback = fn;
+}
+
+#ifndef _WIN32
 void CConfigWatcher::setWatchList(const std::vector<std::string>& paths) {
 
     // we clear all watches first, because whichever fired is now invalid
@@ -73,10 +87,6 @@ void CConfigWatcher::setWatchList(const std::vector<std::string>& paths) {
     }
 }
 
-void CConfigWatcher::setOnChange(const std::function<void(const SConfigWatchEvent&)>& fn) {
-    m_watchCallback = fn;
-}
-
 void CConfigWatcher::onInotifyEvent() {
     constexpr size_t                                     BUFFER_SIZE = sizeof(inotify_event) + NAME_MAX + 1;
     alignas(inotify_event) std::array<char, BUFFER_SIZE> buffer      = {};
@@ -109,3 +119,4 @@ void CConfigWatcher::onInotifyEvent() {
         offset += sizeof(inotify_event) + ev->len;
     }
 }
+#endif

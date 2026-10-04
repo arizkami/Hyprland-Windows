@@ -254,11 +254,27 @@ namespace WindowsTiling {
         return m_layout;
     }
     void CWindowManager::setGap(int gap) {
-        m_gap = std::clamp(gap, 0, 64);
+        setGaps(gap, gap);
+    }
+    void CWindowManager::setGaps(int inner, int outer) {
+        m_gap      = std::clamp(inner, 0, 64);
+        m_outerGap = std::clamp(outer, 0, 64);
         relayout();
     }
     int CWindowManager::gap() const {
         return m_gap;
+    }
+
+    int CWindowManager::outerGap() const {
+        return m_outerGap;
+    }
+
+    std::vector<SWindowRecord> CWindowManager::snapshot() const {
+        std::vector<SWindowRecord> result;
+        result.reserve(m_windows.size());
+        for (const auto& [window, record] : m_windows)
+            result.push_back(record);
+        return result;
     }
 
     void CWindowManager::relayout() {
@@ -288,7 +304,7 @@ namespace WindowsTiling {
                 info.rcWork.right - info.rcWork.left,
                 info.rcWork.bottom - info.rcWork.top,
             };
-            const auto placements = arrange(ids, work, m_layout, gap, gap);
+            const auto placements = arrange(ids, work, m_layout, gap, MulDiv(m_outerGap, static_cast<int>(dpiX), 96));
             if (placements.empty()) {
                 m_status = L"Too many windows for this work area; keeping original placements.";
                 for (const auto id : ids)
@@ -369,10 +385,10 @@ namespace WindowsTiling {
         }
     }
 
-    void CWindowManager::toggleFloating() {
-        const auto it = m_windows.find(GetForegroundWindow());
+    bool CWindowManager::toggleFloating(HWND window) {
+        const auto it = m_windows.find(window ? window : GetForegroundWindow());
         if (it == m_windows.end())
-            return;
+            return false;
         auto& record        = it->second;
         record.userFloating = !record.floating;
         record.rejected     = false;
@@ -380,14 +396,15 @@ namespace WindowsTiling {
         if (record.floating)
             restore(record);
         relayout();
+        return true;
     }
 
-    void CWindowManager::focus(EDirection direction) {
+    bool CWindowManager::focus(EDirection direction) {
         if (!m_enabled)
-            return;
+            return false;
         const auto current = m_windows.find(GetForegroundWindow());
         if (current == m_windows.end())
-            return;
+            return false;
         std::vector<SPlacement> candidates;
         for (const auto& [window, record] : m_windows) {
             if (!record.floating && !record.minimized)
@@ -398,11 +415,32 @@ namespace WindowsTiling {
         }
         const auto target = directionalFocus(candidates, current->second.id, direction);
         if (!target)
-            return;
+            return false;
         for (const auto& [window, record] : m_windows) {
-            if (record.id == *target && !SetForegroundWindow(window))
-                m_status = L"Windows declined the foreground activation request.";
+            if (record.id != *target)
+                continue;
+            if (SetForegroundWindow(window))
+                return true;
+            m_status = L"Windows declined the foreground activation request.";
         }
+        return false;
+    }
+
+    bool CWindowManager::focusWindow(HWND window) {
+        const auto it = m_windows.find(window);
+        if (it == m_windows.end() || !IsWindow(window))
+            return false;
+        if (IsIconic(window))
+            ShowWindow(window, SW_RESTORE);
+        if (SetForegroundWindow(window))
+            return true;
+        m_status = L"Windows declined the foreground activation request.";
+        return false;
+    }
+
+    bool CWindowManager::closeWindow(HWND window) {
+        // WM_CLOSE lets the application prompt for unsaved work, matching killactive.
+        return m_windows.contains(window) && IsWindow(window) && PostMessageW(window, WM_CLOSE, 0, 0);
     }
 
     size_t CWindowManager::managedCount() const {

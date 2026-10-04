@@ -1,6 +1,7 @@
 #pragma once
 
 #include "IHID.hpp"
+#include <optional>
 #include "../macros.hpp"
 #include "../helpers/math/Math.hpp"
 

@@ -2,6 +2,9 @@
 
 #include "defines.hpp"
 #include <cstring>
+#ifdef _WIN32
+#include <io.h>
+#endif
 
 namespace SignalSafe {
     template <uint16_t N>
@@ -121,6 +124,10 @@ namespace SignalSafe {
         }
 
         void writeCmdOutput(const char* cmd) {
+#ifdef _WIN32
+            // No fork() in a crash handler on Windows; the report omits command output.
+            *this += "<command output unavailable on Windows>\n";
+#else
             int pipefd[2];
             if (pipe(pipefd) < 0) {
                 *this += "<pipe(pipefd) failed with";
@@ -178,12 +185,17 @@ namespace SignalSafe {
                 }
                 close(pipefd[0]);
             }
+#endif
         }
 
         void flush() {
             size_t i = 0;
             while (i < m_writeBufPos) {
+#ifdef _WIN32
+                auto written = ::_write(m_fd, m_writeBuf + i, sc<unsigned int>(m_writeBufPos - i));
+#else
                 auto written = ::write(m_fd, m_writeBuf + i, m_writeBufPos - i);
+#endif
                 if (written <= 0) {
                     return;
                 }

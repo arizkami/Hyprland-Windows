@@ -164,6 +164,10 @@ void IKeyboard::updateKeymapFD() {
     m_xkbKeymapV1String = cKeymapV1Str;
     free(cKeymapV1Str); // NOLINT(cppcoreguidelines-no-malloc,-warnings-as-errors)
 
+#ifdef _WIN32
+    // The fds only carry the keymap to Wayland clients; Windows has none.
+    return;
+#endif
     CFileDescriptor rw, ro, rwV1, roV1;
     if (!allocateSHMFilePair(m_xkbKeymapString.length() + 1, rw, ro))
         LOG(Log::ERR, "IKeyboard: failed to allocate shm pair for the keymap");

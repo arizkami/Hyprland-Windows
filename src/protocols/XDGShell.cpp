@@ -636,7 +636,7 @@ CXDGSurfaceResource::CXDGSurfaceResource(SP<CXdgSurface> resource_, SP<CXDGWMBas
 
     m_resource->setSetWindowGeometry([this](CXdgSurface* r, int32_t x, int32_t y, int32_t w, int32_t h) {
         LOG(Log::DEBUG, "xdg_surface {:x} requests geometry {}x{} {}x{}", (uintptr_t)this, x, y, w, h);
-        m_pending.geometry = {x, y, w, h};
+        m_pending.geometry = CBox(x, y, w, h);
         if (m_surface)
             m_surface->m_pending.updated.bits.xdgshell = true;
     });
@@ -697,7 +697,7 @@ CXDGPositionerResource::CXDGPositionerResource(SP<CXdgPositioner> resource_, SP<
             return;
         }
 
-        m_state.anchorRect = {x, y, w, h};
+        m_state.anchorRect = CBox(x, y, w, h);
     });
 
     m_resource->setSetOffset([this](CXdgPositioner* r, int32_t x, int32_t y) { m_state.offset = {x, y}; });

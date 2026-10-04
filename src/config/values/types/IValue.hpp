@@ -1,6 +1,8 @@
 #pragma once
 
 #include <type_traits>
+#include <optional>
+#include <string>
 #include <typeinfo>
 
 #include "../../supplementary/propRefresher/PropRefresher.hpp"

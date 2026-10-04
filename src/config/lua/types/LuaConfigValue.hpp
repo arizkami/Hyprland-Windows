@@ -1,6 +1,8 @@
 #pragma once
 
 #include <cstdint>
+#include <optional>
+#include <string>
 #include <typeinfo>
 
 #include "../../shared/Types.hpp"

@@ -15,13 +15,16 @@ An independent, experimental Windows adaptation of [Hyprland](https://github.com
 - Monitor work areas in physical screen coordinates, with DIP gaps scaled per monitor. Both inner and outer gaps use the panel's gap value (0–64 DIP); the geometry API accepts independent values.
 - Owned dialogs and fixed-size windows float by default. Own-process, shell, hidden, cloaked, tool and child windows are excluded.
 - Directional focus, floating toggle, opt-in management, hotkeys, and restoration on disable or normal exit.
+- `hyprctl.exe`, built from the original `hyprctl/src/main.cpp` entry, talking to the manager over a per-login named pipe. Replies follow upstream text and `-j` JSON shapes. Hotkeys run the same dispatchers.
 - WM_GETMINMAXINFO negotiation with a bounded timeout, DWM invisible-frame compensation, SetWindowPos without activation/z-order changes, and delayed reconciliation of actual visible bounds. Windows that cannot fit or reject placement are restored and left floating; remaining windows relayout. An explicit user drag opts that window out until toggled back.
 - Event-driven rendering and coalesced, one-shot relayout/reconciliation timers. No desktop polling loop or continuous idle redraw.
 - RAII resources, graphics resource recreation on device removal/reset or D2D target loss, and a session-local guard against duplicate managers.
 
 ## Windows prerequisites and build
 
-Use Windows 10/11 x64 with an interactive desktop and DWM enabled. Initial support targets MSVC (Visual Studio 2022 or later), CMake 3.24+, Git, and a Windows 10/11 SDK. In Visual Studio Installer, install **Desktop development with C++**, including the x64 MSVC compiler and Windows SDK. CMake must be on PATH. A first configuration needs network access to fetch Yoga.
+Use Windows 10/11 x64 with an interactive desktop and DWM enabled. Initial support targets MSVC (Visual Studio 2022 or later), CMake 3.24+, Git, and a Windows 10/11 SDK. In Visual Studio Installer, install **Desktop development with C++**, including the x64 MSVC compiler, Windows SDK and the **vcpkg package manager** component. CMake must be on PATH. A first configuration needs network access to fetch Yoga, the pinned hypr* libraries and libwayland headers, and to build vcpkg dependencies (pixman, Lua, re2, muParser, GoogleTest, Khronos headers). That first vcpkg build takes several minutes; later configurations reuse the binary cache.
+
+vcpkg is located automatically: an explicit `CMAKE_TOOLCHAIN_FILE`, then `VCPKG_ROOT`, then the copy bundled with Visual Studio. Packages use the `x64-windows-static-md` triplet, so no extra DLLs ship next to the executables. Build directories configured before vcpkg was introduced must be recreated.
 
 From the repository root in PowerShell, using Visual Studio 2022:
 
@@ -65,6 +68,28 @@ Panel buttons also change the gaps and restore/exit. Hotkey registration conflic
 
 Original WINDOWPLACEMENT is saved immediately before first managing a window, including its normal rectangle and maximized state. Disable, floating toggle, rejected placement and normal exit restore surviving windows. Hidden windows remain hidden during restoration. A user drag preserves the user's new geometry while management runs; its saved placement is still restored on disable/exit. Failed restorations are reported and their snapshots retained for a subsequent attempt. Snapshots are in memory: forced termination, a process crash, application refusal, or a hung/elevated application can prevent restoration. Closing a surviving application is never part of restoration.
 
+## hyprctl
+
+`hyprctl.exe` is built next to `HyprlandWindows.exe`. It connects to `\\.\pipe\HyprlandWindows-<session>-<logon SID>`. The pipe ACL admits only the current logon session, remote clients are rejected, and requests are capped at 4096 bytes. Commands run on the UI thread, one at a time.
+
+```powershell
+hyprctl clients                 # upstream text format; add -j for JSON
+hyprctl -j monitors
+hyprctl dispatch togglemanagement
+hyprctl dispatch focuswindow title:^Notepad$
+hyprctl --batch "keyword general:gaps_in 8; keyword general:gaps_out 16"
+hyprctl getoption general:layout
+```
+
+| Kind | Supported on Windows |
+| --- | --- |
+| Queries | `version`, `systeminfo`, `status`, `instances`, `clients`, `activewindow`, `monitors [all]`, `binds`, `layouts`, `cursorpos`, `splash`, `getoption` |
+| Dispatchers | `togglemanagement`, `enable`, `disable`, `cyclelayout`, `togglefloating`/`setfloating`/`settiled [window]`, `movefocus l\|r\|u\|d`, `focuswindow <window>`, `killactive`, `closewindow [window]`, `exit` |
+| Keywords | `general:layout dwindle\|master`, `general:gaps_in <0..64>`, `general:gaps_out <0..64>` |
+| Flags | `-j`, `-q`/`--quiet`, `-i 0`, `--batch` |
+
+Window selectors follow Hyprland: `activewindow`, `address:0x…` (the HWND), `pid:N`, `class:REGEX`, `title:REGEX`, or a bare class regex. `id:N` selects the Windows-specific stable client ID. `killactive` and `closewindow` send `WM_CLOSE`, so applications can still prompt for unsaved work. Gaps are uniform; `getoption` reports them in Hyprland's CSS form (`custom type: 8 8 8 8`). Configuration files, workspaces, `reload` and `exec` are not implemented yet. `--batch` runs commands in order and stops at the first failure.
+
 ## Architecture
 
 | Layer | Files | Responsibility |
@@ -75,6 +100,9 @@ Original WINDOWPLACEMENT is saved immediately before first managing a window, in
 | UI layout | `windows/src/Panel.*` | Yoga Flexbox layout, drawing commands, rounded/clipped hit regions, control state |
 | GraphicEngineCore | `windows/src/Graphics.*` | D3D11/HLSL shapes, D2D GPU text rasterization, DirectWrite fallback, DXGI presentation and composition resources |
 | Application | `src/main.cpp` → `windows/platform/win32/EntryPoint.hpp` / `Application.cpp` | Platform selection, native window/message lifecycle, DPI, inputs, hotkeys and one-shot scheduling |
+| IPC | `windows/platform/win32/IpcTransport.*` / `IpcServer.*` | Named-pipe framing, logon-SID ACL, bounded I/O with cancellation, worker-to-UI-thread handoff |
+| Commands and binds | `windows/platform/win32/Commands.*` / `Bindings.*` | hyprctl queries, dispatchers, keywords and window selectors; the bind table used by hotkeys and `hyprctl binds` |
+| hyprctl | `hyprctl/src/main.cpp` → `windows/platform/win32/Hyprctl.*` | CLI flags, batches, UTF-16 console output |
 
 The panel's background, controls and text share one swap chain and one composition visual. Layout nodes, drawing commands and the composition layer are separate. DirectComposition only composes this application's visual. Direct2D rasterizes DirectWrite layouts directly onto the DXGI surface, using grayscale text antialiasing on a premultiplied-alpha target. HLSL emits premultiplied colors and uses matching source-over blending.
 
@@ -90,12 +118,12 @@ Close any running Hyprland Windows panel before the native test. On an interacti
 ctest --test-dir windows/build -C Release --output-on-failure
 ```
 
-Four suites cover geometry/filter policy, shared inherited math regression, Yoga layout and rounded/clip hit testing, and a native integration harness. The harness creates its own test windows and launches the manager with `--test-process <fixture PID>`, restricting discovery/hooks/placement to that process. It exercises actual hotkeys using SendInput, changes foreground focus, and closes its fixtures afterward. It never enables management of the user's other applications. The scoped mode also exposes local WM_APP test controls/telemetry; normal launches ignore those messages. It must not be used as a production IPC API.
+The suites cover hyprutils (portable and Windows-specific tests), hyprlang parsing, upstream Hyprland unit tests for the ported subset, geometry/filter policy, shared inherited math regression, Yoga layout and rounded/clip hit testing, named-pipe IPC robustness (encoding, size limits, concurrent clients, shutdown cancellation), and a native integration harness. The harness also drives `hyprctl.exe` for queries, output formats, selectors, focus, floating, close, batches and exit. The harness creates its own test windows and launches the manager with `--test-process <fixture PID>`, restricting discovery/hooks/placement to that process. It exercises actual hotkeys using SendInput, changes foreground focus, and closes its fixtures afterward. It never enables management of the user's other applications. The scoped mode also exposes local WM_APP test controls/telemetry; normal launches ignore those messages. It must not be used as a production IPC API.
 
 For a headless Windows build, run only the unit suites:
 
 ```powershell
-ctest --test-dir windows/build -C Release -R "layout_policy|inherited_geometry_regression|panel_layout_clipping" --output-on-failure
+ctest --test-dir windows/build -C Release -R "layout_policy|inherited_geometry_regression|panel_layout_clipping|native_ipc_robustness" --output-on-failure
 ```
 
 The geometry/policy suite can also configure on other platforms without Yoga or Windows dependencies:
@@ -108,12 +136,32 @@ ctest --test-dir windows/build-portable --output-on-failure
 
 Validation on 2026-10-04:
 
-- MSVC Release build and all three suites passed on Windows 11.
+- MSVC Release build and all five suites passed on Windows 11.
+- hyprctl was checked against a running manager: upstream-shaped `version`, `monitors`, `binds`, `status` and `-j clients` output, then `dispatch exit`.
 - Native fixtures verified opt-in startup, both layouts, actual registered hotkeys and directional focus, owned-dialog/tool filtering, appearance/minimize/restore/destruction, hidden-window preservation, constraint negotiation and delayed rejected-geometry fallback, pointer disable, resize presentation, original/maximized-placement restoration and hotkey cleanup.
 - The test observed one monitor at 144 DPI (150%). Initial panel DIP sizing and monitor placement passed. Mixed-DPI transitions across multiple physical monitors remain unverified.
 - Native idle check: no presented frames and 0 ms reported process CPU time over 1.1 seconds. This is a short observation, not a long-duration performance benchmark.
 - The actual rendered panel was visually inspected for rounded shapes/gradient/border, multilingual Thai/Japanese/Arabic text fallback, panel layout and pointer selection. An initial high-DPI clipping issue was found and fixed.
 - Real GPU device removal/reset recovery, Windows 10 execution, long-duration desktop operation, diverse third-party application compatibility, elevated/hung applications and deterministic same-process HWND reuse are not runtime-verified. Device-loss recovery paths exist but should not be described as hardware-reset tested.
+
+## Porting upstream Hyprland (hyprland.exe)
+
+The milestone above is a separate Windows application. The goal is to build Hyprland's own `src/` as `hyprland.exe` with Windows support added, keeping DWM as the compositor: upstream layout, workspaces, rules, keybinds and IPC will move real HWNDs. The build uses MSVC.
+
+| Stage | Scope | Status |
+| --- | --- | --- |
+| 1. Foundation | hypr* libraries and the upstream code that needs no backend | In progress |
+| 2. Backends | aquamarine Win32 backend (monitors as outputs, input), xkbcommon, libdrm headers, Wayland event loop | Not started |
+| 3. Desktop model | `Win32Backend : IWindowBackend` wrapping HWNDs for `CWindow`; workspaces show/hide real windows | Not started |
+| 4. Compositor | `CCompositor` on Windows, keyboard hook into keybinds, upstream IPC over the named pipe; `hyprland.exe` replaces `HyprlandWindows.exe` | Not started |
+| 5. Decorations | Borders and overlays as layered windows, animations | Not started |
+
+Stage 1 status:
+
+- hyprutils, hyprlang and hyprgraphics (colour) are fetched at the revisions pinned in `flake.lock`. Windows support lives in `windows/patches/<library>/`, written as upstreamable patches: CRT file descriptors, `CreateProcessW` processes with CRT-compatible argument quoting, named-mutex semaphores, process locks, a waitable-timer event loop backend, and Windows path/home handling. hyprutils' portable tests plus new Windows tests (44) and hyprlang's parser test pass.
+- `windows/compat` holds the compat layer for upstream sources: libwayland headers, Wayland core-protocol enums generated from `wayland.xml` by `generate-wayland-protocol.py`, and `Platform.hpp`, which is force-included and supplies POSIX vocabulary types (`pid_t`, `ssize_t`, ...). Upstream sources changed only where they were not portable: platform guards in `includes.hpp`, MSVC's RTTI macro in `defines.hpp`, and standard headers that libstdc++ had provided transitively.
+- `hyprland_core` builds 106 of the 441 upstream `src/` files (config value types, Lua config types, rule match engines, the workspace model and filters, view geometry, helpers). 13 upstream unit-test files (113 tests) pass on MSVC as `hyprland_upstream_units`.
+- Most remaining files are blocked by headers rather than logic: aquamarine (render and format headers include it), xkbcommon (`IKeyboard`), hyprwayland-scanner protocol headers, and the GL renderer.
 
 ## Limitations and remaining roadmap
 
@@ -125,6 +173,6 @@ Next work includes broader app compatibility, mixed-DPI multi-monitor validation
 
 ## Credits and licenses
 
-Hyprland was created by vaxerski and its contributors. This independent adaptation retains the inherited **BSD-3-Clause** [LICENSE](LICENSE), copyright conditions and disclaimer. New Windows adaptation code follows that repository license. Yoga retains its **MIT** notice in [windows/third-party/Yoga-LICENSE.txt](windows/third-party/Yoga-LICENSE.txt); include it when distributing binaries linked with Yoga. Other inherited third-party notices remain unchanged.
+Hyprland was created by vaxerski and its contributors. This independent adaptation retains the inherited **BSD-3-Clause** [LICENSE](LICENSE), copyright conditions and disclaimer. New Windows adaptation code follows that repository license. Yoga retains its **MIT** notice in [windows/third-party/Yoga-LICENSE.txt](windows/third-party/Yoga-LICENSE.txt); include it when distributing binaries linked with Yoga. The upstream port additionally fetches hyprutils, hyprlang and hyprgraphics (BSD-3-Clause) and libwayland headers (MIT), and uses vcpkg packages under their own licenses (pixman MIT, Lua MIT, RE2 BSD-3-Clause, muParser BSD-2-Clause, GoogleTest BSD-3-Clause for tests, Khronos headers Apache-2.0/MIT); include their notices with any binary distribution. Other inherited third-party notices remain unchanged.
 
 Windows work belongs in [arizkami/Hyprland-Windows](https://github.com/arizkami/Hyprland-Windows). Upstream contributions and developer-facing communication remain subject to Hypr's [AI usage policy](https://github.com/hyprwm/.github/blob/main/policies/AI_USAGE.md) and [issue guidelines](https://wiki.hypr.land/contributing-and-debugging/issue-guidelines/). AI agents must not interact with upstream PRs/issues/discussions; violations can lead to permanent bans. This milestone was implemented and tested with AI assistance and must be reviewed by its human maintainer.

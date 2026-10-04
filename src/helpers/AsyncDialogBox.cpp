@@ -2,7 +2,9 @@
 #include "./fs/FsUtils.hpp"
 #include <csignal>
 #include <algorithm>
+#ifndef _WIN32
 #include <unistd.h>
+#endif
 #include "../managers/eventLoop/EventLoopManager.hpp"
 #include "../desktop/rule/windowRule/WindowRule.hpp"
 #include "../desktop/rule/Engine.hpp"
@@ -13,6 +15,11 @@ static std::vector<std::pair<pid_t, WP<CAsyncDialogBox>>> asyncDialogBoxes;
 
 //
 SP<CAsyncDialogBox> CAsyncDialogBox::create(const std::string& title, const std::string& description, std::vector<std::string> buttons) {
+#ifdef _WIN32
+    // hyprland-dialog is a Qt/Wayland client; Windows takes the same path as a system without it.
+    LOG(Log::ERR, "CAsyncDialogBox: cannot create, dialogs are not available on Windows yet");
+    return nullptr;
+#endif
     if (!NFsUtils::executableExistsInPath("hyprland-dialog")) {
         LOG(Log::ERR, "CAsyncDialogBox: cannot create, no hyprland-dialog");
         return nullptr;
@@ -57,6 +64,7 @@ static int onFdWrite(int fd, uint32_t mask, void* data) {
 }
 
 void CAsyncDialogBox::onWrite(int fd, uint32_t mask) {
+#ifndef _WIN32
     if (mask & WL_EVENT_READABLE) {
         std::array<char, 1024> buf;
         int                    ret = 0;
@@ -90,9 +98,13 @@ void CAsyncDialogBox::onWrite(int fd, uint32_t mask) {
         m_selfReference.reset();
         return;
     }
+#endif
 }
 
 SP<CPromise<std::string>> CAsyncDialogBox::open() {
+#ifdef _WIN32
+    return nullptr; // create() never returns a box on Windows
+#else
     std::string buttonsString = "";
     for (auto& b : m_buttons) {
         buttonsString += std::format("{};", b);
@@ -139,6 +151,7 @@ SP<CPromise<std::string>> CAsyncDialogBox::open() {
     auto promise = CPromise<std::string>::make([this](SP<CPromiseResolver<std::string>> r) { m_promiseResolver = r; });
 
     return promise;
+#endif
 }
 
 void CAsyncDialogBox::kill() {

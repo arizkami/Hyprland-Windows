@@ -1,8 +1,10 @@
+#include "../platform/win32/IpcTransport.hpp"
 #include <windows.h>
 #include <dwmapi.h>
 #include <shellscalingapi.h>
 #include <array>
 #include <algorithm>
+#include <charconv>
 #include <chrono>
 #include <iostream>
 #include <stdexcept>
@@ -69,8 +71,56 @@ static void hotkey(WORD key) {
     require(SendInput(static_cast<UINT>(events.size()), events.data(), sizeof(INPUT)) == events.size(), "Hotkey SendInput failed");
     pump(450);
 }
+struct SCliResult {
+    DWORD       code = 1;
+    std::string output;
+};
+static SCliResult cli(const wchar_t* executable, const std::wstring& arguments) {
+    SECURITY_ATTRIBUTES security{
+        sizeof(SECURITY_ATTRIBUTES),
+        nullptr,
+        TRUE,
+    };
+    HANDLE rawRead = nullptr, rawWrite = nullptr;
+    require(CreatePipe(&rawRead, &rawWrite, &security, 0), "Create CLI output pipe");
+    WindowsIPC::Handle read(rawRead), write(rawWrite);
+    require(SetHandleInformation(read.get(), HANDLE_FLAG_INHERIT, 0), "Protect parent pipe handle");
+    STARTUPINFOW startup{};
+    startup.cb         = sizeof(startup);
+    startup.dwFlags    = STARTF_USESTDHANDLES;
+    startup.hStdOutput = startup.hStdError = write.get();
+    startup.hStdInput                      = GetStdHandle(STD_INPUT_HANDLE);
+    PROCESS_INFORMATION process{};
+    std::wstring        command = L"\"" + std::wstring(executable) + L"\" " + arguments;
+    require(CreateProcessW(nullptr, command.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW, nullptr, nullptr, &startup, &process), "Launch hyprctl.exe");
+    WindowsIPC::Handle child(process.hProcess), thread(process.hThread);
+    write.reset();
+    SCliResult result;
+    const auto deadline = GetTickCount64() + 10000;
+    bool       exited   = false;
+    for (;;) {
+        DWORD available = 0;
+        while (PeekNamedPipe(read.get(), nullptr, 0, nullptr, &available, nullptr) && available) {
+            std::array<char, 4096> buffer{};
+            DWORD                  bytes = 0;
+            require(ReadFile(read.get(), buffer.data(), std::min<DWORD>(available, static_cast<DWORD>(buffer.size())), &bytes, nullptr), "Read CLI output");
+            result.output.append(buffer.data(), bytes);
+        }
+        if (exited)
+            break;
+        exited = WaitForSingleObject(child.get(), 0) == WAIT_OBJECT_0;
+        if (GetTickCount64() >= deadline) {
+            TerminateProcess(child.get(), 2);
+            throw std::runtime_error("CLI deadline exceeded");
+        }
+        pump(10);
+    }
+    require(GetExitCodeProcess(child.get(), &result.code), "CLI exit code");
+    result.output.erase(std::remove(result.output.begin(), result.output.end(), '\r'), result.output.end());
+    return result;
+}
 int wmain(int argc, wchar_t** argv) {
-    if (argc != 2)
+    if (argc != 3)
         return 2;
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     WNDCLASSW wc{};
@@ -114,6 +164,48 @@ int wmain(int argc, wchar_t** argv) {
         }
         require(panel != nullptr, "Panel initialization timed out");
         pump(400);
+        auto commandResult = cli(argv[2], L"-j clients");
+        require(commandResult.code == 0 && commandResult.output.find("Native test: first") != std::string::npos && commandResult.output.find("excluded tool") == std::string::npos,
+                "hyprctl clients must enumerate scoped tracked windows");
+        require(cli(argv[2], L"-j monitors").output.find("workArea") != std::string::npos, "hyprctl monitor work area");
+        require(cli(argv[2], L"-j instances").output.find(std::to_string(process.dwProcessId)) != std::string::npos, "hyprctl running instance PID");
+        require(cli(argv[2], L"dispatch exec calc.exe").code == 1, "Unsupported dispatcher must fail");
+        require(cli(argv[2], L"keyword general:gaps_in 65").code == 1, "Out-of-range keyword must fail");
+        require(cli(argv[2], L"keyword general:gaps_in 7junk").code == 1, "Malformed keyword must fail");
+        require(cli(argv[2], L"--batch \"keyword general:gaps_in 7; keyword general:gaps_out 19\"").code == 0, "CLI batch independent gaps");
+        require(cli(argv[2], L"-j getoption general:gaps_in").output == "{\"option\": \"general:gaps_in\", \"custom\": \"7 7 7 7\", \"set\": true }\n", "Inner gap persisted");
+        require(cli(argv[2], L"getoption general:gaps_out").output == "custom type: 19 19 19 19\nset: true\n", "Outer gap independent");
+        require(cli(argv[2], L"getoption general:layout").output == "str: dwindle\nset: false\n", "Unset option reports default");
+        require(cli(argv[2], L"--batch \"keyword general:gaps_in 12; invalid; keyword general:gaps_out 3\"").code == 1, "Batch stops on failure");
+        require(cli(argv[2], L"getoption general:gaps_out").output.starts_with("custom type: 19 "), "Batch does not run commands after failure");
+        require(cli(argv[2], L"-q keyword general:gaps_out 12").output.empty(), "Quiet suppresses success output");
+        require(cli(argv[2], L"getoption general:nonexistent").code == 1, "Unknown option must fail");
+        require(cli(argv[2], L"dispatch togglefloating id:999999").code == 1, "Unknown client ID must fail");
+        require(cli(argv[2], L"dispatch focuswindow title:(").code == 1, "Invalid selector regex must fail");
+        require(cli(argv[2], L"dispatch movefocus x").code == 1, "Invalid direction must fail");
+        require(cli(argv[2], L"dispatch exit now").code == 1, "Argument-free dispatcher rejects arguments");
+        require(cli(argv[2], L"-i 1 version").code == 1, "Only instance 0 exists on Windows");
+        require(cli(argv[2], L"").code == 1, "Missing command prints usage and fails");
+        const auto address = [](HWND window) {
+            std::array<char, 32> text{};
+            const auto           end = std::to_chars(text.data(), text.data() + text.size(), reinterpret_cast<uintptr_t>(window), 16).ptr;
+            return std::string("0x") + std::string(text.data(), end);
+        };
+        const auto wideText = [](const std::string& text) { return std::wstring(text.begin(), text.end()); };
+        require(commandResult.output.find("\"address\": \"" + address(first) + '"') != std::string::npos, "JSON clients report Hyprland window addresses");
+        const auto clientsText = cli(argv[2], L"clients").output;
+        require(clientsText.find("Window " + address(first).substr(2) + " -> Native test: first:\n") != std::string::npos &&
+                    clientsText.find("\tclass: HyprlandNativeTestFixture\n") != std::string::npos,
+                "Plain clients output follows Hyprland's text format");
+        const auto version = cli(argv[2], L"-j version").output;
+        require(version.find("\"platform\": \"windows\"") != std::string::npos && version.find("\"commit\": ") != std::string::npos, "JSON version");
+        require(cli(argv[2], L"version").output.starts_with("Hyprland "), "Plain version");
+        const auto binds = cli(argv[2], L"-j binds").output;
+        require(binds.find("\"modmask\": 12, \"submap\": \"\", \"key\": \"T\"") != std::string::npos && binds.find("\"dispatcher\": \"togglemanagement\"") != std::string::npos,
+                "Binds report Ctrl+Alt dispatchers");
+        require(cli(argv[2], L"cursorpos").output.find(", ") != std::string::npos, "Cursor position");
+        require(cli(argv[2], L"-j layouts").output == "[\"dwindle\", \"master\"]\n", "Layouts");
+        require(cli(argv[2], L"monitors").output.starts_with("Monitor "), "Plain monitors");
         const auto query = [&](WPARAM op) { return SendMessageW(panel, WM_APP + 10, op, 0); };
         RECT       client{};
         GetClientRect(panel, &client);
@@ -174,6 +266,20 @@ int wmain(int argc, wchar_t** argv) {
         require(query(4) == 2, "Floating hotkey returns window to tiling");
         hotkey(bounds(first).left < bounds(second).left ? VK_LEFT : VK_RIGHT);
         require(GetForegroundWindow() == first, "Directional focus hotkey");
+        AllowSetForegroundWindow(process.dwProcessId);
+        require(cli(argv[2], L"dispatch focuswindow address:" + wideText(address(second))).code == 0 && GetForegroundWindow() == second, "focuswindow by address");
+        require(cli(argv[2], L"-j activewindow").output.find("Native test: second") != std::string::npos, "activewindow follows focus");
+        AllowSetForegroundWindow(process.dwProcessId);
+        require(cli(argv[2], L"dispatch focuswindow title:^Native test: first$").code == 0 && GetForegroundWindow() == first, "focuswindow by title regex");
+        require(cli(argv[2], L"dispatch setfloating address:" + wideText(address(second))).code == 0 && query(4) == 1, "setfloating");
+        require(cli(argv[2], L"dispatch setfloating address:" + wideText(address(second))).code == 0 && query(4) == 1, "setfloating is idempotent");
+        require(cli(argv[2], L"dispatch settiled address:" + wideText(address(second))).code == 0 && query(4) == 2, "settiled");
+        const HWND closeTarget = create(L"Native test: close target", nullptr);
+        pump(500);
+        require(query(4) == 3, "Close target managed");
+        require(cli(argv[2], L"dispatch closewindow title:close target$").code == 0, "closewindow by title");
+        pump(500);
+        require(!IsWindow(closeTarget) && query(4) == 2, "closewindow asks the application to close");
         const HWND third = create(L"Native test: lifecycle", nullptr);
         pump(500);
         require(query(4) == 3, "New window auto-managed");
@@ -220,13 +326,16 @@ int wmain(int argc, wchar_t** argv) {
         SetWindowPos(panel, nullptr, 0, 0, 700, 760, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
         pump(400);
         require(query(3) > beforeResize, "Resize must redraw/present");
-        hotkey('Q');
+        require(cli(argv[2], L"dispatch disable").code == 0, "CLI disable restores");
+        require(same(bounds(first), firstOriginal) && same(bounds(second), secondOriginal), "CLI restoration");
+        require(cli(argv[2], L"dispatch enable").code == 0, "CLI enable tiles");
+        require(cli(argv[2], L"dispatch exit").code == 0, "CLI exit reply arrives before shutdown");
         pump(400);
-        require(WaitForSingleObject(process.hProcess, 0) == WAIT_OBJECT_0, "Exit hotkey closes manager");
+        require(WaitForSingleObject(process.hProcess, 0) == WAIT_OBJECT_0, "CLI exit closes manager");
         require(same(bounds(first), firstOriginal) && same(bounds(second), secondOriginal), "Normal exit restores originals");
         require(RegisterHotKey(nullptr, 99, MOD_CONTROL | MOD_ALT, 'T'), "Hotkeys released on exit");
         UnregisterHotKey(nullptr, 99);
-        std::cout << "Native rendering/resize, opt-in, hotkeys/focus, policy, lifecycle, constraints and restoration passed\n";
+        std::cout << "Native rendering/resize, hyprctl IPC, opt-in, hotkeys/focus, policy, lifecycle, constraints and restoration passed\n";
         result = 0;
     } catch (const std::exception& error) { std::cerr << error.what() << '\n'; }
     if (panel && IsWindow(panel)) {

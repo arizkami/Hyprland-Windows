@@ -1,3 +1,5 @@
+// Windows: windows/platform/win32/InitHelpers.cpp
+#ifndef _WIN32
 #include <linux/capability.h>
 #include <sys/prctl.h>
 
@@ -202,3 +204,4 @@ void NInit::gainRealTime() {
     });
 #endif
 }
+#endif

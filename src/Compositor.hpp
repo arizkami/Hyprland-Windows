@@ -1,6 +1,8 @@
 #pragma once
 
+#ifndef _WIN32
 #include <sys/resource.h>
+#endif
 
 #include <ranges>
 
@@ -102,7 +104,9 @@ class CCompositor {
 
     uint64_t                       m_hyprlandPID    = 0;
     wl_event_source*               m_critSigSource  = nullptr;
+#ifndef _WIN32
     rlimit                         m_originalNofile = {};
+#endif
     Hyprutils::OS::CFileDescriptor m_watchdogWriteFd;
 
     struct {

@@ -25,7 +25,11 @@ class CMainLoopExecutor {
     void onFired();
 
   private:
+#ifdef _WIN32
+    void* m_signalEvent = nullptr; // auto-reset event; a pipe on Linux
+#else
     Hyprutils::OS::CFileDescriptor m_readFd, m_writeFd;
+#endif
     wl_event_source*               m_event = nullptr;
     std::function<void()>          m_fn;
 };

@@ -1,5 +1,6 @@
 #include "IntMatchEngine.hpp"
 #include "../../../debug/log/Logger.hpp"
+#include <string>
 
 using namespace Desktop::Rule;
 

@@ -54,7 +54,7 @@ CTextInputV3::CTextInputV3(SP<CZwpTextInputV3> resource_) : m_resource(resource_
 
     m_resource->setSetCursorRectangle([this](CZwpTextInputV3* r, int32_t x, int32_t y, int32_t w, int32_t h) {
         m_pending.box.updated   = true;
-        m_pending.box.cursorBox = {x, y, w, h};
+        m_pending.box.cursorBox = CBox(x, y, w, h);
     });
 
     m_resource->setEnable([this](CZwpTextInputV3* r) {

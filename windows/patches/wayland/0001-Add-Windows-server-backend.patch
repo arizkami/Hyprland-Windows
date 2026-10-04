@@ -1,0 +1,1421 @@
+diff --git a/src/event-loop-win32.c b/src/event-loop-win32.c
+new file mode 100644
+index 0000000..cd8c14a
+--- /dev/null
++++ b/src/event-loop-win32.c
+@@ -0,0 +1,610 @@
++/*
++ * Copyright © 2008 Kristian Høgsberg
++ * Copyright © 2026 Hyprland Windows contributors
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining
++ * a copy of this software and associated documentation files (the
++ * "Software"), to deal in the Software without restriction, including
++ * without limitation the rights to use, copy, modify, merge, publish,
++ * distribute, sublicense, and/or sell copies of the Software, and to
++ * permit persons to whom the Software is furnished to do so, subject to
++ * the following conditions:
++ *
++ * The above copyright notice and this permission notice (including the
++ * next paragraph) shall be included in all copies or substantial
++ * portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
++ * EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
++ * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
++ * NONINFRINGEMENT.  IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS
++ * BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
++ * ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
++ * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++/*
++ * Windows implementation of the wl_event_loop API (event-loop.c is epoll based).
++ *
++ * Sources wait on kernel handles with MsgWaitForMultipleObjectsEx:
++ *  - fd sources: CRT descriptors whose OS handle is waitable (signaled = readable)
++ *  - handle sources (wl_event_loop_add_handle): any waitable HANDLE
++ *  - one message source (wl_event_loop_add_win32_messages): the thread's message queue
++ *  - signal sources: CRT signal() handlers that set a flag and wake the loop
++ * Timers keep deadlines on the QueryPerformanceCounter clock and bound the wait.
++ * Idle, check and destroy lists follow event-loop.c exactly.
++ */
++
++#ifdef _WIN32
++
++#define WIN32_LEAN_AND_MEAN
++#include <windows.h>
++#include <io.h>
++/* Some SDK headers define interface as a keyword alias; libwayland uses it as a name. */
++#undef interface
++#include <errno.h>
++#include <signal.h>
++#include <stdbool.h>
++#include <stdint.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include "wayland-util.h"
++#include "wayland-private.h"
++#include "wayland-server-core.h"
++#include "wayland-server-private.h"
++
++/* MsgWaitForMultipleObjectsEx waits on at most MAXIMUM_WAIT_OBJECTS - 1 handles. */
++#define WL_WIN32_MAX_HANDLES (MAXIMUM_WAIT_OBJECTS - 1)
++#define WL_WIN32_SIGNALS     NSIG
++
++enum wl_win32_source_kind {
++	WL_WIN32_SOURCE_FD,
++	WL_WIN32_SOURCE_HANDLE,
++	WL_WIN32_SOURCE_TIMER,
++	WL_WIN32_SOURCE_SIGNAL,
++	WL_WIN32_SOURCE_IDLE,
++	WL_WIN32_SOURCE_MESSAGES,
++};
++
++struct wl_event_source {
++	enum wl_win32_source_kind kind;
++	struct wl_event_loop *loop;
++	struct wl_list link;       /* idle, check or destroy list */
++	struct wl_list loop_link;  /* loop->sources; empty once removed */
++	void *data;
++	bool removed;
++	bool due;                  /* timers: collected for the current dispatch pass */
++	int64_t due_deadline;      /* timers: deadline that made it due, for ordering */
++	HANDLE handle;
++	int fd;
++	uint32_t mask;
++	int64_t deadline;          /* timers: QPC ticks, 0 = disarmed */
++	int signal_number;
++	union {
++		wl_event_loop_fd_func_t fd;
++		wl_event_loop_handle_func_t handle;
++		wl_event_loop_timer_func_t timer;
++		wl_event_loop_signal_func_t signal;
++		wl_event_loop_idle_func_t idle;
++	} func;
++};
++
++struct wl_event_loop {
++	struct wl_list sources;
++	struct wl_list check_list;
++	struct wl_list idle_list;
++	struct wl_list destroy_list;
++	struct wl_event_source *messages;
++	HANDLE wake;
++	/* Waitable timer armed for the earliest timer source. A high-resolution
++	 * timer avoids the ~15 ms granularity of wait timeouts. */
++	HANDLE timer;
++	struct wl_priv_signal destroy_signal;
++};
++
++/* CRT signal handlers cannot carry context; pending signals wake every loop. */
++static volatile LONG pending_signals[WL_WIN32_SIGNALS];
++static HANDLE signal_wake;
++
++static int64_t
++qpc_now(void)
++{
++	LARGE_INTEGER now;
++	QueryPerformanceCounter(&now);
++	return now.QuadPart;
++}
++
++static int64_t
++qpc_frequency(void)
++{
++	static int64_t frequency;
++	if (!frequency) {
++		LARGE_INTEGER value;
++		QueryPerformanceFrequency(&value);
++		frequency = value.QuadPart;
++	}
++	return frequency;
++}
++
++static struct wl_event_source *
++source_create(struct wl_event_loop *loop, enum wl_win32_source_kind kind, void *data)
++{
++	struct wl_event_source *source = zalloc(sizeof *source);
++	if (!source)
++		return NULL;
++	source->kind = kind;
++	source->loop = loop;
++	source->data = data;
++	source->fd = -1;
++	wl_list_init(&source->link);
++	wl_list_insert(loop->sources.prev, &source->loop_link);
++	return source;
++}
++
++static size_t
++count_waitable(struct wl_event_loop *loop)
++{
++	struct wl_event_source *source;
++	size_t count = 0;
++
++	wl_list_for_each(source, &loop->sources, loop_link) {
++		if (!source->removed && source->handle && source->mask)
++			count++;
++	}
++	return count;
++}
++
++static struct wl_event_source *
++add_waitable(struct wl_event_loop *loop, enum wl_win32_source_kind kind, HANDLE handle, uint32_t mask, void *data)
++{
++	if (!handle || handle == INVALID_HANDLE_VALUE) {
++		errno = EBADF;
++		return NULL;
++	}
++	/* The loop reserves slots for its wake event, timer and signal event. */
++	if (mask && count_waitable(loop) >= WL_WIN32_MAX_HANDLES - 3) {
++		errno = EMFILE;
++		return NULL;
++	}
++
++	struct wl_event_source *source = source_create(loop, kind, data);
++	if (!source)
++		return NULL;
++	source->handle = handle;
++	source->mask = mask;
++	return source;
++}
++
++WL_EXPORT struct wl_event_source *
++wl_event_loop_add_fd(struct wl_event_loop *loop,
++		     int fd, uint32_t mask,
++		     wl_event_loop_fd_func_t func,
++		     void *data)
++{
++	/* The source owns its fd, as in event-loop.c (which dups it). */
++	int owned = _dup(fd);
++	if (owned < 0)
++		return NULL;
++
++	HANDLE handle = (HANDLE)_get_osfhandle(owned);
++	struct wl_event_source *source = add_waitable(loop, WL_WIN32_SOURCE_FD, handle, mask, data);
++	if (!source) {
++		_close(owned);
++		return NULL;
++	}
++	source->fd = owned;
++	source->func.fd = func;
++	return source;
++}
++
++WL_EXPORT int
++wl_event_source_fd_update(struct wl_event_source *source, uint32_t mask)
++{
++	if (source->kind != WL_WIN32_SOURCE_FD) {
++		errno = EINVAL;
++		return -1;
++	}
++	source->mask = mask;
++	return 0;
++}
++
++WL_EXPORT struct wl_event_source *
++wl_event_loop_add_handle(struct wl_event_loop *loop,
++			 void *handle,
++			 wl_event_loop_handle_func_t func,
++			 void *data)
++{
++	struct wl_event_source *source = add_waitable(loop, WL_WIN32_SOURCE_HANDLE, handle, WL_EVENT_READABLE, data);
++	if (source)
++		source->func.handle = func;
++	return source;
++}
++
++WL_EXPORT struct wl_event_source *
++wl_event_loop_add_win32_messages(struct wl_event_loop *loop,
++				 wl_event_loop_idle_func_t func,
++				 void *data)
++{
++	if (loop->messages) {
++		errno = EBUSY;
++		return NULL;
++	}
++	struct wl_event_source *source = source_create(loop, WL_WIN32_SOURCE_MESSAGES, data);
++	if (!source)
++		return NULL;
++	source->func.idle = func;
++	loop->messages = source;
++	return source;
++}
++
++WL_EXPORT struct wl_event_source *
++wl_event_loop_add_timer(struct wl_event_loop *loop,
++			wl_event_loop_timer_func_t func,
++			void *data)
++{
++	struct wl_event_source *source = source_create(loop, WL_WIN32_SOURCE_TIMER, data);
++	if (source)
++		source->func.timer = func;
++	return source;
++}
++
++WL_EXPORT int
++wl_event_source_timer_update(struct wl_event_source *source, int ms_delay)
++{
++	if (source->kind != WL_WIN32_SOURCE_TIMER) {
++		errno = EINVAL;
++		return -1;
++	}
++	if (ms_delay > 0)
++		source->deadline = qpc_now() + (int64_t)ms_delay * qpc_frequency() / 1000;
++	else
++		source->deadline = 0;
++	return 0;
++}
++
++static void
++signal_handler(int signal_number)
++{
++	/* The CRT resets the disposition before calling the handler. */
++	signal(signal_number, signal_handler);
++	if (signal_number < 0 || signal_number >= WL_WIN32_SIGNALS)
++		return;
++	InterlockedExchange(&pending_signals[signal_number], 1);
++	if (signal_wake)
++		SetEvent(signal_wake);
++}
++
++WL_EXPORT struct wl_event_source *
++wl_event_loop_add_signal(struct wl_event_loop *loop,
++			 int signal_number,
++			 wl_event_loop_signal_func_t func,
++			 void *data)
++{
++	if (signal_number < 0 || signal_number >= WL_WIN32_SIGNALS) {
++		errno = EINVAL;
++		return NULL;
++	}
++	if (!signal_wake) {
++		signal_wake = CreateEventW(NULL, TRUE, FALSE, NULL);
++		if (!signal_wake)
++			return NULL;
++	}
++	if (signal(signal_number, signal_handler) == SIG_ERR)
++		return NULL;
++
++	struct wl_event_source *source = source_create(loop, WL_WIN32_SOURCE_SIGNAL, data);
++	if (!source)
++		return NULL;
++	source->signal_number = signal_number;
++	source->func.signal = func;
++	return source;
++}
++
++WL_EXPORT struct wl_event_source *
++wl_event_loop_add_idle(struct wl_event_loop *loop,
++		       wl_event_loop_idle_func_t func,
++		       void *data)
++{
++	struct wl_event_source *source = zalloc(sizeof *source);
++	if (!source)
++		return NULL;
++	source->kind = WL_WIN32_SOURCE_IDLE;
++	source->loop = loop;
++	source->data = data;
++	source->fd = -1;
++	source->func.idle = func;
++	wl_list_init(&source->loop_link);
++	wl_list_insert(loop->idle_list.prev, &source->link);
++	return source;
++}
++
++WL_EXPORT void
++wl_event_source_check(struct wl_event_source *source)
++{
++	wl_list_insert(source->loop->check_list.prev, &source->link);
++}
++
++WL_EXPORT int
++wl_event_source_remove(struct wl_event_source *source)
++{
++	struct wl_event_loop *loop = source->loop;
++
++	if (source->kind == WL_WIN32_SOURCE_FD && source->fd >= 0) {
++		_close(source->fd);
++		source->fd = -1;
++	}
++	if (source->kind == WL_WIN32_SOURCE_SIGNAL) {
++		bool shared = false;
++		struct wl_event_source *other;
++		wl_list_for_each(other, &loop->sources, loop_link) {
++			if (other != source && !other->removed && other->kind == WL_WIN32_SOURCE_SIGNAL && other->signal_number == source->signal_number)
++				shared = true;
++		}
++		if (!shared)
++			signal(source->signal_number, SIG_DFL);
++	}
++	if (loop->messages == source)
++		loop->messages = NULL;
++
++	source->removed = true;
++	source->handle = NULL;
++	source->deadline = 0;
++	wl_list_remove(&source->loop_link);
++	wl_list_init(&source->loop_link);
++	wl_list_remove(&source->link);
++	wl_list_insert(&loop->destroy_list, &source->link);
++	return 0;
++}
++
++static void
++process_destroy_list(struct wl_event_loop *loop)
++{
++	struct wl_event_source *source, *next;
++
++	wl_list_for_each_safe(source, next, &loop->destroy_list, link)
++		free(source);
++	wl_list_init(&loop->destroy_list);
++}
++
++WL_EXPORT struct wl_event_loop *
++wl_event_loop_create(void)
++{
++	struct wl_event_loop *loop = zalloc(sizeof *loop);
++	if (!loop)
++		return NULL;
++
++	loop->wake = CreateEventW(NULL, FALSE, FALSE, NULL);
++	if (!loop->wake) {
++		free(loop);
++		return NULL;
++	}
++	loop->timer = CreateWaitableTimerExW(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
++	if (!loop->timer)
++		loop->timer = CreateWaitableTimerW(NULL, FALSE, NULL);
++	if (!loop->timer) {
++		CloseHandle(loop->wake);
++		free(loop);
++		return NULL;
++	}
++	wl_list_init(&loop->sources);
++	wl_list_init(&loop->check_list);
++	wl_list_init(&loop->idle_list);
++	wl_list_init(&loop->destroy_list);
++	wl_priv_signal_init(&loop->destroy_signal);
++	return loop;
++}
++
++WL_EXPORT void
++wl_event_loop_destroy(struct wl_event_loop *loop)
++{
++	wl_priv_signal_final_emit(&loop->destroy_signal, loop);
++
++	/* Sources the owner never removed are released with the loop, like the
++	 * epoll set in event-loop.c; their memory follows the same rule. */
++	while (!wl_list_empty(&loop->sources)) {
++		struct wl_event_source *source = wl_container_of(loop->sources.next, source, loop_link);
++		wl_event_source_remove(source);
++	}
++	process_destroy_list(loop);
++	CloseHandle(loop->timer);
++	CloseHandle(loop->wake);
++	free(loop);
++}
++
++static bool
++post_dispatch_check(struct wl_event_loop *loop)
++{
++	struct wl_event_source *source, *next;
++	bool needs_recheck = false;
++
++	wl_list_for_each_safe(source, next, &loop->check_list, link) {
++		int result = 0;
++		if (source->kind == WL_WIN32_SOURCE_FD)
++			result = source->func.fd(source->fd, 0, source->data);
++		else if (source->kind == WL_WIN32_SOURCE_HANDLE)
++			result = source->func.handle(source->handle, source->data);
++		if (result < 0)
++			wl_log("Source dispatch function returned negative value!\n");
++		needs_recheck |= result != 0;
++	}
++	return needs_recheck;
++}
++
++WL_EXPORT void
++wl_event_loop_dispatch_idle(struct wl_event_loop *loop)
++{
++	while (!wl_list_empty(&loop->idle_list)) {
++		struct wl_event_source *source = wl_container_of(loop->idle_list.next, source, link);
++		source->func.idle(source->data);
++		wl_event_source_remove(source);
++	}
++}
++
++static void
++dispatch_timers(struct wl_event_loop *loop)
++{
++	const int64_t now = qpc_now();
++	struct wl_event_source *source;
++
++	/* Collect first, so callbacks that re-arm timers do not fire them again in
++	 * this pass; then run in deadline order, as event-loop.c's heap does. */
++	wl_list_for_each(source, &loop->sources, loop_link) {
++		if (source->kind != WL_WIN32_SOURCE_TIMER || source->removed || !source->deadline || source->deadline > now)
++			continue;
++		source->due_deadline = source->deadline;
++		source->deadline = 0;
++		source->due = true;
++	}
++
++	for (;;) {
++		struct wl_event_source *next = NULL;
++		/* Re-scan each time: a callback may remove sources from the list. */
++		wl_list_for_each(source, &loop->sources, loop_link) {
++			if (source->kind == WL_WIN32_SOURCE_TIMER && source->due && (!next || source->due_deadline < next->due_deadline))
++				next = source;
++		}
++		if (!next)
++			return;
++		next->due = false;
++		next->func.timer(next->data);
++	}
++}
++
++/* Arms loop->timer for the earliest timer deadline. Returns false if none is armed. */
++static bool
++arm_loop_timer(struct wl_event_loop *loop)
++{
++	int64_t earliest = 0;
++	struct wl_event_source *source;
++
++	wl_list_for_each(source, &loop->sources, loop_link) {
++		if (source->kind == WL_WIN32_SOURCE_TIMER && source->deadline && (!earliest || source->deadline < earliest))
++			earliest = source->deadline;
++	}
++	if (!earliest) {
++		CancelWaitableTimer(loop->timer);
++		return false;
++	}
++
++	/* Negative due times are relative, in 100 ns units; at least one unit. */
++	int64_t remaining = earliest - qpc_now();
++	int64_t units = remaining <= 0 ? 1 : remaining * 10000000 / qpc_frequency();
++	LARGE_INTEGER due;
++	due.QuadPart = -(units > 0 ? units : 1);
++	return SetWaitableTimer(loop->timer, &due, 0, NULL, NULL, FALSE) != 0;
++}
++
++static void
++dispatch_signals(struct wl_event_loop *loop)
++{
++	struct wl_event_source *source, *next;
++
++	for (int signal_number = 0; signal_number < WL_WIN32_SIGNALS; ++signal_number) {
++		if (!InterlockedExchange(&pending_signals[signal_number], 0))
++			continue;
++		wl_list_for_each_safe(source, next, &loop->sources, loop_link) {
++			if (source->kind == WL_WIN32_SOURCE_SIGNAL && !source->removed && source->signal_number == signal_number)
++				source->func.signal(signal_number, source->data);
++		}
++	}
++	if (signal_wake)
++		ResetEvent(signal_wake);
++}
++
++WL_EXPORT int
++wl_event_loop_dispatch(struct wl_event_loop *loop, int timeout)
++{
++	HANDLE handles[MAXIMUM_WAIT_OBJECTS];
++	struct wl_event_source *owners[MAXIMUM_WAIT_OBJECTS];
++	struct wl_event_source *source;
++	DWORD count = 0;
++
++	wl_event_loop_dispatch_idle(loop);
++
++	handles[count] = loop->wake;
++	owners[count++] = NULL;
++	if (arm_loop_timer(loop)) {
++		handles[count] = loop->timer;
++		owners[count++] = NULL;
++	}
++	if (signal_wake) {
++		handles[count] = signal_wake;
++		owners[count++] = NULL;
++	}
++	wl_list_for_each(source, &loop->sources, loop_link) {
++		if (source->removed || !source->handle || !source->mask || count >= WL_WIN32_MAX_HANDLES)
++			continue;
++		handles[count] = source->handle;
++		owners[count++] = source;
++	}
++
++	const DWORD wakeMask = loop->messages ? QS_ALLINPUT : 0;
++	const DWORD waited = MsgWaitForMultipleObjectsEx(count, handles, timeout < 0 ? INFINITE : (DWORD)timeout, wakeMask, MWMO_INPUTAVAILABLE);
++	if (waited == WAIT_FAILED) {
++		errno = EINVAL;
++		return -1;
++	}
++
++	/* Timers first, as in event-loop.c, so other sources cannot cancel due timers. */
++	dispatch_timers(loop);
++	dispatch_signals(loop);
++
++	/* Every signaled handle is dispatched, not only the one that ended the wait.
++	 * The wait already consumed an auto-reset object's signal, so that one is
++	 * dispatched without re-checking. */
++	for (DWORD i = 0; i < count; ++i) {
++		struct wl_event_source *owner = owners[i];
++		if (!owner || owner->removed)
++			continue;
++		if (waited != WAIT_OBJECT_0 + i && WaitForSingleObject(handles[i], 0) != WAIT_OBJECT_0)
++			continue;
++		if (owner->kind == WL_WIN32_SOURCE_FD)
++			owner->func.fd(owner->fd, WL_EVENT_READABLE & owner->mask, owner->data);
++		else
++			owner->func.handle(owner->handle, owner->data);
++	}
++
++	if (loop->messages && !loop->messages->removed) {
++		MSG message;
++		if (PeekMessageW(&message, NULL, 0, 0, PM_NOREMOVE))
++			loop->messages->func.idle(loop->messages->data);
++	}
++
++	process_destroy_list(loop);
++	wl_event_loop_dispatch_idle(loop);
++	while (post_dispatch_check(loop))
++		;
++	return 0;
++}
++
++WL_EXPORT int
++wl_event_loop_get_fd(struct wl_event_loop *loop)
++{
++	/* No single descriptor represents the loop on Windows. */
++	errno = ENOSYS;
++	return -1;
++}
++
++WL_EXPORT void
++wl_event_loop_wake(struct wl_event_loop *loop)
++{
++	SetEvent(loop->wake);
++}
++
++WL_EXPORT void
++wl_event_loop_add_destroy_listener(struct wl_event_loop *loop,
++				   struct wl_listener *listener)
++{
++	wl_priv_signal_add(&loop->destroy_signal, listener);
++}
++
++WL_EXPORT struct wl_listener *
++wl_event_loop_get_destroy_listener(struct wl_event_loop *loop,
++				   wl_notify_func_t notify)
++{
++	return wl_priv_signal_get(&loop->destroy_signal, notify);
++}
++
++#endif /* _WIN32 */
+diff --git a/src/wayland-server-core.h b/src/wayland-server-core.h
+index c2dcc21..06d5aee 100644
+--- a/src/wayland-server-core.h
++++ b/src/wayland-server-core.h
+@@ -172,6 +172,28 @@ wl_event_loop_add_idle(struct wl_event_loop *loop,
+ 		       wl_event_loop_idle_func_t func,
+ 		       void *data);
+ 
++#ifdef _WIN32
++/* Windows extensions (event-loop-win32.c). A handle source fires while the
++ * waitable kernel object is signaled. The message source fires when the calling
++ * thread's message queue has input; the callback is expected to pump it. */
++typedef int (*wl_event_loop_handle_func_t)(void *handle, void *data);
++
++struct wl_event_source *
++wl_event_loop_add_handle(struct wl_event_loop *loop,
++			 void *handle,
++			 wl_event_loop_handle_func_t func,
++			 void *data);
++
++struct wl_event_source *
++wl_event_loop_add_win32_messages(struct wl_event_loop *loop,
++				 wl_event_loop_idle_func_t func,
++				 void *data);
++
++/* Ends a blocking wl_event_loop_dispatch() from any thread. */
++void
++wl_event_loop_wake(struct wl_event_loop *loop);
++#endif
++
+ int
+ wl_event_loop_get_fd(struct wl_event_loop *loop);
+ 
+diff --git a/src/wayland-server-win32.c b/src/wayland-server-win32.c
+new file mode 100644
+index 0000000..74625ed
+--- /dev/null
++++ b/src/wayland-server-win32.c
+@@ -0,0 +1,766 @@
++/*
++ * Copyright © 2008 Kristian Høgsberg
++ * Copyright © 2026 Hyprland Windows contributors
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining
++ * a copy of this software and associated documentation files (the
++ * "Software"), to deal in the Software without restriction, including
++ * without limitation the rights to use, copy, modify, merge, publish,
++ * distribute, sublicense, and/or sell copies of the Software, and to
++ * permit persons to whom the Software is furnished to do so, subject to
++ * the following conditions:
++ *
++ * The above copyright notice and this permission notice (including the
++ * next paragraph) shall be included in all copies or substantial
++ * portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
++ * EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
++ * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
++ * NONINFRINGEMENT.  IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS
++ * BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
++ * ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
++ * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++/*
++ * Windows implementation of the libwayland-server display API.
++ *
++ * Windows has no Unix-socket transport with descriptor passing, so this build
++ * accepts no Wayland clients: adding sockets and creating clients fail with
++ * ENOTSUP. Everything a compositor uses without clients is real: the display,
++ * its event loop, globals (with names, versions and the global filter), serials,
++ * destroy/client-created signals, protocol loggers and run/terminate.
++ * Client and resource functions exist so protocol code links; without clients
++ * no resource is ever created, and they behave as on an empty client.
++ * The shared-memory buffer API likewise reports that no buffers exist.
++ */
++
++#ifdef _WIN32
++
++#include <errno.h>
++#include <stdarg.h>
++#include <stdbool.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include "wayland-util.h"
++#include "wayland-private.h"
++#include "wayland-server-private.h"
++#include "wayland-server.h"
++
++struct wl_display {
++	struct wl_event_loop *loop;
++	bool run;
++	uint32_t next_global_name;
++	uint32_t serial;
++	struct wl_list global_list;
++	struct wl_list client_list;
++	struct wl_list protocol_loggers;
++	struct wl_priv_signal destroy_signal;
++	struct wl_priv_signal create_client_signal;
++	wl_display_global_filter_func_t global_filter;
++	void *global_filter_data;
++	size_t max_buffer_size;
++};
++
++struct wl_global {
++	struct wl_display *display;
++	const struct wl_interface *interface;
++	uint32_t name;
++	uint32_t version;
++	void *data;
++	wl_global_bind_func_t bind;
++	struct wl_list link;
++	bool removed;
++};
++
++/* Layout of the deprecated public struct (wayland-private.h hides it). */
++struct wl_resource {
++	struct wl_object object;
++	wl_resource_destroy_func_t destroy;
++	struct wl_list link;
++	struct wl_signal destroy_signal;
++	struct wl_client *client;
++	void *data;
++};
++
++struct wl_protocol_logger {
++	struct wl_list link;
++	wl_protocol_logger_func_t func;
++	void *user_data;
++};
++
++static void
++log_stderr_handler(const char *fmt, va_list arg)
++{
++	vfprintf(stderr, fmt, arg);
++}
++
++WL_EXPORT void
++wl_log_set_handler_server(wl_log_func_t handler)
++{
++	wl_log_handler = handler ? handler : log_stderr_handler;
++}
++
++/* wl_priv_signal: identical to wayland-server.c. */
++
++void
++wl_priv_signal_init(struct wl_priv_signal *signal)
++{
++	wl_list_init(&signal->listener_list);
++	wl_list_init(&signal->emit_list);
++}
++
++void
++wl_priv_signal_add(struct wl_priv_signal *signal, struct wl_listener *listener)
++{
++	wl_list_insert(signal->listener_list.prev, &listener->link);
++}
++
++struct wl_listener *
++wl_priv_signal_get(struct wl_priv_signal *signal, wl_notify_func_t notify)
++{
++	struct wl_listener *l;
++
++	wl_list_for_each(l, &signal->listener_list, link)
++		if (l->notify == notify)
++			return l;
++	wl_list_for_each(l, &signal->emit_list, link)
++		if (l->notify == notify)
++			return l;
++	return NULL;
++}
++
++void
++wl_priv_signal_emit(struct wl_priv_signal *signal, void *data)
++{
++	struct wl_listener *l;
++	struct wl_list *pos;
++
++	wl_list_insert_list(&signal->emit_list, &signal->listener_list);
++	wl_list_init(&signal->listener_list);
++
++	while (!wl_list_empty(&signal->emit_list)) {
++		pos = signal->emit_list.next;
++		l = wl_container_of(pos, l, link);
++		wl_list_remove(pos);
++		wl_list_insert(&signal->listener_list, pos);
++		l->notify(l, data);
++	}
++}
++
++void
++wl_priv_signal_final_emit(struct wl_priv_signal *signal, void *data)
++{
++	struct wl_listener *l;
++	struct wl_list *pos;
++
++	while (!wl_list_empty(&signal->listener_list)) {
++		pos = signal->listener_list.next;
++		l = wl_container_of(pos, l, link);
++		wl_list_remove(pos);
++		wl_list_init(pos);
++		l->notify(l, data);
++	}
++}
++
++/* Display */
++
++WL_EXPORT struct wl_display *
++wl_display_create(void)
++{
++	struct wl_display *display = zalloc(sizeof *display);
++	if (!display)
++		return NULL;
++
++	display->loop = wl_event_loop_create();
++	if (!display->loop) {
++		free(display);
++		return NULL;
++	}
++
++	wl_list_init(&display->global_list);
++	wl_list_init(&display->client_list);
++	wl_list_init(&display->protocol_loggers);
++	wl_priv_signal_init(&display->destroy_signal);
++	wl_priv_signal_init(&display->create_client_signal);
++	display->next_global_name = 1;
++	display->max_buffer_size = WL_BUFFER_DEFAULT_MAX_SIZE;
++	return display;
++}
++
++WL_EXPORT void
++wl_display_destroy(struct wl_display *display)
++{
++	struct wl_global *global, *next;
++
++	wl_priv_signal_final_emit(&display->destroy_signal, display);
++	wl_event_loop_destroy(display->loop);
++	wl_list_for_each_safe(global, next, &display->global_list, link)
++		free(global);
++	wl_list_remove(&display->protocol_loggers);
++	free(display);
++}
++
++WL_EXPORT struct wl_event_loop *
++wl_display_get_event_loop(struct wl_display *display)
++{
++	return display->loop;
++}
++
++WL_EXPORT void
++wl_display_terminate(struct wl_display *display)
++{
++	display->run = false;
++	wl_event_loop_wake(display->loop);
++}
++
++WL_EXPORT void
++wl_display_run(struct wl_display *display)
++{
++	display->run = true;
++	while (display->run) {
++		if (wl_event_loop_dispatch(display->loop, -1) < 0)
++			break;
++	}
++}
++
++WL_EXPORT void
++wl_display_flush_clients(struct wl_display *display)
++{
++}
++
++WL_EXPORT void
++wl_display_destroy_clients(struct wl_display *display)
++{
++}
++
++WL_EXPORT void
++wl_display_set_default_max_buffer_size(struct wl_display *display, size_t max_buffer_size)
++{
++	display->max_buffer_size = max_buffer_size < WL_BUFFER_DEFAULT_MAX_SIZE ? WL_BUFFER_DEFAULT_MAX_SIZE : max_buffer_size;
++}
++
++WL_EXPORT uint32_t
++wl_display_get_serial(const struct wl_display *display)
++{
++	return display->serial;
++}
++
++WL_EXPORT uint32_t
++wl_display_next_serial(struct wl_display *display)
++{
++	return ++display->serial;
++}
++
++WL_EXPORT void
++wl_display_add_destroy_listener(struct wl_display *display, struct wl_listener *listener)
++{
++	wl_priv_signal_add(&display->destroy_signal, listener);
++}
++
++WL_EXPORT struct wl_listener *
++wl_display_get_destroy_listener(struct wl_display *display, wl_notify_func_t notify)
++{
++	return wl_priv_signal_get(&display->destroy_signal, notify);
++}
++
++WL_EXPORT void
++wl_display_add_client_created_listener(struct wl_display *display, struct wl_listener *listener)
++{
++	wl_priv_signal_add(&display->create_client_signal, listener);
++}
++
++WL_EXPORT struct wl_list *
++wl_display_get_client_list(struct wl_display *display)
++{
++	return &display->client_list;
++}
++
++WL_EXPORT void
++wl_display_set_global_filter(struct wl_display *display, wl_display_global_filter_func_t filter, void *data)
++{
++	display->global_filter = filter;
++	display->global_filter_data = data;
++}
++
++WL_EXPORT int
++wl_display_add_socket(struct wl_display *display, const char *name)
++{
++	errno = ENOTSUP;
++	return -1;
++}
++
++WL_EXPORT const char *
++wl_display_add_socket_auto(struct wl_display *display)
++{
++	errno = ENOTSUP;
++	return NULL;
++}
++
++WL_EXPORT int
++wl_display_add_socket_fd(struct wl_display *display, int sock_fd)
++{
++	errno = ENOTSUP;
++	return -1;
++}
++
++WL_EXPORT int
++wl_display_init_shm(struct wl_display *display)
++{
++	return 0;
++}
++
++WL_EXPORT uint32_t *
++wl_display_add_shm_format(struct wl_display *display, uint32_t format)
++{
++	errno = ENOTSUP;
++	return NULL;
++}
++
++WL_EXPORT struct wl_protocol_logger *
++wl_display_add_protocol_logger(struct wl_display *display, wl_protocol_logger_func_t func, void *user_data)
++{
++	struct wl_protocol_logger *logger = zalloc(sizeof *logger);
++	if (!logger)
++		return NULL;
++	logger->func = func;
++	logger->user_data = user_data;
++	wl_list_insert(&display->protocol_loggers, &logger->link);
++	return logger;
++}
++
++WL_EXPORT void
++wl_protocol_logger_destroy(struct wl_protocol_logger *logger)
++{
++	wl_list_remove(&logger->link);
++	free(logger);
++}
++
++/* Globals: identical bookkeeping to wayland-server.c; no registry has listeners. */
++
++WL_EXPORT struct wl_global *
++wl_global_create(struct wl_display *display, const struct wl_interface *interface, int version, void *data, wl_global_bind_func_t bind)
++{
++	if (version < 1) {
++		wl_log("wl_global_create: failing to create interface '%s' with version %d because it is less than 1\n", interface->name, version);
++		return NULL;
++	}
++	if (version > interface->version) {
++		wl_log("wl_global_create: implemented version for '%s' higher than interface version (%d > %d)\n", interface->name, version, interface->version);
++		return NULL;
++	}
++	if (display->next_global_name >= UINT32_MAX) {
++		wl_log("wl_global_create: ran out of global names\n");
++		return NULL;
++	}
++
++	struct wl_global *global = zalloc(sizeof *global);
++	if (!global)
++		return NULL;
++	global->display = display;
++	global->name = display->next_global_name++;
++	global->interface = interface;
++	global->version = version;
++	global->data = data;
++	global->bind = bind;
++	wl_list_insert(display->global_list.prev, &global->link);
++	return global;
++}
++
++WL_EXPORT void
++wl_global_remove(struct wl_global *global)
++{
++	if (global->removed)
++		wl_abort("wl_global_remove: called twice on the same global '%s#%u'", global->interface->name, global->name);
++	global->removed = true;
++}
++
++WL_EXPORT void
++wl_global_destroy(struct wl_global *global)
++{
++	if (!global->removed)
++		wl_global_remove(global);
++	wl_list_remove(&global->link);
++	free(global);
++}
++
++WL_EXPORT const struct wl_interface *
++wl_global_get_interface(const struct wl_global *global)
++{
++	return global->interface;
++}
++
++WL_EXPORT uint32_t
++wl_global_get_name(const struct wl_global *global, const struct wl_client *client)
++{
++	return global->name;
++}
++
++WL_EXPORT uint32_t
++wl_global_get_version(const struct wl_global *global)
++{
++	return global->version;
++}
++
++WL_EXPORT struct wl_display *
++wl_global_get_display(const struct wl_global *global)
++{
++	return global->display;
++}
++
++WL_EXPORT void *
++wl_global_get_user_data(const struct wl_global *global)
++{
++	return global->data;
++}
++
++WL_EXPORT void
++wl_global_set_user_data(struct wl_global *global, void *data)
++{
++	global->data = data;
++}
++
++/* Clients: none can exist on Windows. */
++
++WL_EXPORT struct wl_client *
++wl_client_create(struct wl_display *display, int fd)
++{
++	errno = ENOTSUP;
++	return NULL;
++}
++
++WL_EXPORT void
++wl_client_destroy(struct wl_client *client)
++{
++}
++
++WL_EXPORT void
++wl_client_flush(struct wl_client *client)
++{
++}
++
++WL_EXPORT struct wl_display *
++wl_client_get_display(struct wl_client *client)
++{
++	return NULL;
++}
++
++WL_EXPORT void
++wl_client_get_credentials(const struct wl_client *client, pid_t *pid, uid_t *uid, gid_t *gid)
++{
++	if (pid)
++		*pid = 0;
++	if (uid)
++		*uid = 0;
++	if (gid)
++		*gid = 0;
++}
++
++WL_EXPORT int
++wl_client_get_fd(struct wl_client *client)
++{
++	return -1;
++}
++
++WL_EXPORT void
++wl_client_add_destroy_listener(struct wl_client *client, struct wl_listener *listener)
++{
++}
++
++WL_EXPORT struct wl_listener *
++wl_client_get_destroy_listener(struct wl_client *client, wl_notify_func_t notify)
++{
++	return NULL;
++}
++
++WL_EXPORT void
++wl_client_add_destroy_late_listener(struct wl_client *client, struct wl_listener *listener)
++{
++}
++
++WL_EXPORT struct wl_listener *
++wl_client_get_destroy_late_listener(struct wl_client *client, wl_notify_func_t notify)
++{
++	return NULL;
++}
++
++WL_EXPORT struct wl_resource *
++wl_client_get_object(struct wl_client *client, uint32_t id)
++{
++	return NULL;
++}
++
++WL_EXPORT void
++wl_client_post_no_memory(struct wl_client *client)
++{
++}
++
++WL_EXPORT void
++wl_client_post_implementation_error(struct wl_client *client, const char *msg, ...)
++{
++}
++
++WL_EXPORT void
++wl_client_add_resource_created_listener(struct wl_client *client, struct wl_listener *listener)
++{
++}
++
++WL_EXPORT void
++wl_client_for_each_resource(struct wl_client *client, wl_client_for_each_resource_iterator_func_t iterator, void *user_data)
++{
++}
++
++WL_EXPORT struct wl_client *
++wl_client_from_link(struct wl_list *link)
++{
++	return NULL;
++}
++
++WL_EXPORT struct wl_list *
++wl_client_get_link(struct wl_client *client)
++{
++	return NULL;
++}
++
++WL_EXPORT void
++wl_client_set_user_data(struct wl_client *client, void *data, wl_user_data_destroy_func_t dtor)
++{
++}
++
++WL_EXPORT void *
++wl_client_get_user_data(struct wl_client *client)
++{
++	return NULL;
++}
++
++WL_EXPORT void
++wl_client_set_max_buffer_size(struct wl_client *client, size_t max_buffer_size)
++{
++}
++
++/* Resources: created only for clients, so none exist. Accessors use the public
++ * struct layout from wayland-server.h. */
++
++WL_EXPORT struct wl_resource *
++wl_resource_create(struct wl_client *client, const struct wl_interface *interface, int version, uint32_t id)
++{
++	errno = ENOTSUP;
++	return NULL;
++}
++
++WL_EXPORT void
++wl_resource_destroy(struct wl_resource *resource)
++{
++}
++
++WL_EXPORT void
++wl_resource_post_event(struct wl_resource *resource, uint32_t opcode, ...)
++{
++}
++
++WL_EXPORT void
++wl_resource_post_event_array(struct wl_resource *resource, uint32_t opcode, union wl_argument *args)
++{
++}
++
++WL_EXPORT void
++wl_resource_queue_event(struct wl_resource *resource, uint32_t opcode, ...)
++{
++}
++
++WL_EXPORT void
++wl_resource_queue_event_array(struct wl_resource *resource, uint32_t opcode, union wl_argument *args)
++{
++}
++
++WL_EXPORT void
++wl_resource_post_error(struct wl_resource *resource, uint32_t code, const char *msg, ...)
++{
++}
++
++WL_EXPORT void
++wl_resource_post_error_vargs(struct wl_resource *resource, uint32_t code, const char *msg, va_list argp)
++{
++}
++
++WL_EXPORT void
++wl_resource_post_no_memory(struct wl_resource *resource)
++{
++}
++
++WL_EXPORT void
++wl_resource_set_implementation(struct wl_resource *resource, const void *implementation, void *data, wl_resource_destroy_func_t destroy)
++{
++	resource->object.implementation = implementation;
++	resource->data = data;
++	resource->destroy = destroy;
++}
++
++WL_EXPORT void
++wl_resource_set_dispatcher(struct wl_resource *resource, wl_dispatcher_func_t dispatcher, const void *implementation, void *data,
++			   wl_resource_destroy_func_t destroy)
++{
++	wl_resource_set_implementation(resource, implementation, data, destroy);
++}
++
++WL_EXPORT void
++wl_resource_set_destructor(struct wl_resource *resource, wl_resource_destroy_func_t destroy)
++{
++	resource->destroy = destroy;
++}
++
++WL_EXPORT uint32_t
++wl_resource_get_id(const struct wl_resource *resource)
++{
++	return resource->object.id;
++}
++
++WL_EXPORT struct wl_list *
++wl_resource_get_link(struct wl_resource *resource)
++{
++	return &resource->link;
++}
++
++WL_EXPORT struct wl_resource *
++wl_resource_from_link(struct wl_list *link)
++{
++	struct wl_resource *resource;
++	return wl_container_of(link, resource, link);
++}
++
++WL_EXPORT struct wl_resource *
++wl_resource_find_for_client(struct wl_list *list, struct wl_client *client)
++{
++	return NULL;
++}
++
++WL_EXPORT struct wl_client *
++wl_resource_get_client(struct wl_resource *resource)
++{
++	return resource->client;
++}
++
++WL_EXPORT void
++wl_resource_set_user_data(struct wl_resource *resource, void *data)
++{
++	resource->data = data;
++}
++
++WL_EXPORT void *
++wl_resource_get_user_data(struct wl_resource *resource)
++{
++	return resource->data;
++}
++
++WL_EXPORT int
++wl_resource_get_version(const struct wl_resource *resource)
++{
++	return resource->object.interface ? resource->object.interface->version : 0;
++}
++
++WL_EXPORT const char *
++wl_resource_get_class(const struct wl_resource *resource)
++{
++	return resource->object.interface ? resource->object.interface->name : NULL;
++}
++
++WL_EXPORT const struct wl_interface *
++wl_resource_get_interface(struct wl_resource *resource)
++{
++	return resource->object.interface;
++}
++
++WL_EXPORT int
++wl_resource_instance_of(struct wl_resource *resource, const struct wl_interface *interface, const void *implementation)
++{
++	return wl_interface_equal(resource->object.interface, interface) && resource->object.implementation == implementation;
++}
++
++WL_EXPORT void
++wl_resource_add_destroy_listener(struct wl_resource *resource, struct wl_listener *listener)
++{
++	wl_signal_add(&resource->destroy_signal, listener);
++}
++
++WL_EXPORT struct wl_listener *
++wl_resource_get_destroy_listener(struct wl_resource *resource, wl_notify_func_t notify)
++{
++	return wl_signal_get(&resource->destroy_signal, notify);
++}
++
++/* Shared memory buffers arrive only from clients. */
++
++WL_EXPORT struct wl_shm_buffer *
++wl_shm_buffer_get(struct wl_resource *resource)
++{
++	return NULL;
++}
++
++WL_EXPORT int32_t
++wl_shm_buffer_get_stride(const struct wl_shm_buffer *buffer)
++{
++	return 0;
++}
++
++WL_EXPORT void *
++wl_shm_buffer_get_data(struct wl_shm_buffer *buffer)
++{
++	return NULL;
++}
++
++WL_EXPORT uint32_t
++wl_shm_buffer_get_format(const struct wl_shm_buffer *buffer)
++{
++	return 0;
++}
++
++WL_EXPORT int32_t
++wl_shm_buffer_get_width(const struct wl_shm_buffer *buffer)
++{
++	return 0;
++}
++
++WL_EXPORT int32_t
++wl_shm_buffer_get_height(const struct wl_shm_buffer *buffer)
++{
++	return 0;
++}
++
++WL_EXPORT void
++wl_shm_buffer_begin_access(struct wl_shm_buffer *buffer)
++{
++}
++
++WL_EXPORT void
++wl_shm_buffer_end_access(struct wl_shm_buffer *buffer)
++{
++}
++
++WL_EXPORT struct wl_shm_buffer *
++wl_shm_buffer_ref(struct wl_shm_buffer *buffer)
++{
++	return buffer;
++}
++
++WL_EXPORT void
++wl_shm_buffer_unref(struct wl_shm_buffer *buffer)
++{
++}
++
++WL_EXPORT struct wl_shm_pool *
++wl_shm_buffer_ref_pool(struct wl_shm_buffer *buffer)
++{
++	return NULL;
++}
++
++WL_EXPORT void
++wl_shm_pool_unref(struct wl_shm_pool *pool)
++{
++}
++
++#endif /* _WIN32 */

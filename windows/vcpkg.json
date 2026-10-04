@@ -1,0 +1,25 @@
+{
+  "name": "hyprland-windows",
+  "version-string": "0.56.0",
+  "builtin-baseline": "5dd2e1600d049b498ff9fb9fe15997533ae0c804",
+  "dependencies": [
+    "egl-registry",
+    "gtest",
+    "lua",
+    "muparser",
+    "opengl-registry",
+    "pixman",
+    "pugixml",
+    "re2"
+  ],
+  "features": {
+    "render": {
+      "description": "Libraries for the upstream renderer and decorations (cairo, pango, glslang)",
+      "dependencies": [
+        "cairo",
+        "glslang",
+        "pango"
+      ]
+    }
+  }
+}

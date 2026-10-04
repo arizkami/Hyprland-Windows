@@ -2,9 +2,12 @@
 #include "../../src/Graphics.hpp"
 #include "../../src/Panel.hpp"
 #include "WindowManager.hpp"
+#include "Bindings.hpp"
+#include "Commands.hpp"
+#include "IpcServer.hpp"
 #include <shellapi.h>
 #include <windowsx.h>
-#include <array>
+#include <format>
 #include <memory>
 #include <stdexcept>
 
@@ -19,20 +22,23 @@ class CApplication {
     LRESULT message(UINT type, WPARAM wparam, LPARAM lparam);
 
   private:
-    HWND                                m_window      = nullptr;
-    DWORD                               m_testProcess = 0;
-    std::unique_ptr<CGraphicEngineCore> m_graphics;
-    std::unique_ptr<CWindowManager>     m_manager;
-    CPanel                              m_panel;
-    std::wstring                        m_hotkeyStatus;
-    std::vector<int>                    m_hotkeys;
-    bool                                m_relayoutPending  = false;
-    bool                                m_reconcilePending = false;
-    EAction                             m_pressed          = EAction::None;
-    void                                update();
-    void                                action(EAction action);
-    void                                registerHotkeys();
-    static LRESULT CALLBACK             procedure(HWND window, UINT type, WPARAM wparam, LPARAM lparam);
+    HWND                                         m_window      = nullptr;
+    DWORD                                        m_testProcess = 0;
+    std::unique_ptr<CGraphicEngineCore>          m_graphics;
+    std::unique_ptr<CWindowManager>              m_manager;
+    std::unique_ptr<WindowsIPC::CCommandHandler> m_commands;
+    std::unique_ptr<WindowsIPC::CIpcServer>      m_ipc;
+    CPanel                                       m_panel;
+    std::wstring                                 m_hotkeyStatus;
+    std::vector<int>                             m_hotkeys;
+    bool                                         m_relayoutPending  = false;
+    bool                                         m_reconcilePending = false;
+    EAction                                      m_pressed          = EAction::None;
+    void                                         update();
+    void                                         action(EAction action);
+    WindowsIPC::SReply                           execute(const std::string& request);
+    void                                         registerHotkeys();
+    static LRESULT CALLBACK                      procedure(HWND window, UINT type, WPARAM wparam, LPARAM lparam);
 };
 
 CApplication::CApplication(DWORD testProcess) : m_testProcess(testProcess) {
@@ -52,6 +58,8 @@ CApplication::CApplication(DWORD testProcess) : m_testProcess(testProcess) {
     try {
         m_graphics = std::make_unique<CGraphicEngineCore>(m_window);
         m_manager  = std::make_unique<CWindowManager>(m_window, testProcess);
+        m_commands = std::make_unique<WindowsIPC::CCommandHandler>(*m_manager);
+        m_ipc      = std::make_unique<WindowsIPC::CIpcServer>(m_window);
         registerHotkeys();
         // CreateWindowEx sizes are physical pixels under PMv2. Size the initial
         // panel in DIP after Windows has selected its actual monitor and DPI.
@@ -63,6 +71,8 @@ CApplication::CApplication(DWORD testProcess) : m_testProcess(testProcess) {
         update();
         ShowWindow(m_window, SW_SHOWNORMAL);
     } catch (...) {
+        m_ipc.reset();
+        m_commands.reset();
         m_manager.reset();
         m_graphics.reset();
         DestroyWindow(m_window);
@@ -73,6 +83,8 @@ CApplication::CApplication(DWORD testProcess) : m_testProcess(testProcess) {
 CApplication::~CApplication() {
     for (int id : m_hotkeys)
         UnregisterHotKey(m_window, id);
+    m_ipc.reset();
+    m_commands.reset();
     m_manager.reset();
     m_graphics.reset();
     if (IsWindow(m_window))
@@ -80,31 +92,16 @@ CApplication::~CApplication() {
 }
 
 void CApplication::registerHotkeys() {
-    const std::array<UINT, 8> keys{{
-        'T',
-        'L',
-        'F',
-        'Q',
-        VK_LEFT,
-        VK_RIGHT,
-        VK_UP,
-        VK_DOWN,
-    }};
-    for (size_t i = 0; i < keys.size(); ++i) {
+    const auto binds = WindowsBinds::defaults();
+    for (size_t i = 0; i < binds.size(); ++i) {
         const int id = static_cast<int>(i) + 1;
-        if (RegisterHotKey(m_window, id, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, keys[i]))
+        if (RegisterHotKey(m_window, id, WindowsBinds::HOTKEY_MODIFIERS | MOD_NOREPEAT, binds[i].key)) {
             m_hotkeys.push_back(id);
-        else {
-            if (m_hotkeyStatus.empty())
-                m_hotkeyStatus = L"Unavailable Ctrl+Alt keys: ";
-            const std::array<std::wstring, 4> arrows{{
-                L"Left",
-                L"Right",
-                L"Up",
-                L"Down",
-            }};
-            m_hotkeyStatus += (i < 4 ? std::wstring(1, static_cast<wchar_t>(keys[i])) : arrows[i - 4]) + L" ";
+            continue;
         }
+        if (m_hotkeyStatus.empty())
+            m_hotkeyStatus = L"Unavailable Ctrl+Alt keys: ";
+        m_hotkeyStatus += WindowsIPC::wide(std::string(binds[i].keyName)) + L" ";
     }
     if (!m_hotkeyStatus.empty())
         m_hotkeyStatus += L"\nUse panel controls.";
@@ -129,6 +126,13 @@ void CApplication::update() {
     InvalidateRect(m_window, nullptr, FALSE);
 }
 
+WindowsIPC::SReply CApplication::execute(const std::string& request) {
+    auto reply = m_commands->execute(request);
+    if (reply.changed)
+        update();
+    return reply;
+}
+
 void CApplication::action(EAction command) {
     switch (command) {
         case EAction::Toggle: m_manager->setEnabled(!m_manager->enabled()); break;
@@ -143,7 +147,7 @@ void CApplication::action(EAction command) {
 
 LRESULT CApplication::message(UINT type, WPARAM wparam, LPARAM lparam) {
     if (type == WM_APP + 10 && m_testProcess) {
-        // Scoped native integration harness only. Production has no IPC control surface.
+        // Scoped native integration harness only. Uses the same manager as production IPC.
         if (wparam == 1)
             action(EAction::Toggle);
         else if (wparam == 2)
@@ -157,6 +161,10 @@ LRESULT CApplication::message(UINT type, WPARAM wparam, LPARAM lparam) {
         return 0;
     }
     switch (type) {
+        case WindowsIPC::IPC_MESSAGE:
+            if (m_ipc && m_manager)
+                m_ipc->drain([this](const std::string& request) { return execute(request); });
+            return 0;
         case RECONCILE_MESSAGE:
             if (!m_reconcilePending) {
                 m_reconcilePending = true;
@@ -251,21 +259,19 @@ LRESULT CApplication::message(UINT type, WPARAM wparam, LPARAM lparam) {
             } else if (wparam == VK_RETURN || wparam == VK_SPACE)
                 action(m_panel.focusedAction());
             return 0;
-        case WM_HOTKEY:
-            if (wparam == 1)
-                action(EAction::Toggle);
-            else if (wparam == 2)
-                action(EAction::Layout);
-            else if (wparam == 3) {
-                m_manager->toggleFloating();
-                update();
-            } else if (wparam == 4)
+        case WM_HOTKEY: {
+            // Binds run the same dispatchers as `hyprctl dispatch`.
+            const auto binds = WindowsBinds::defaults();
+            if (wparam < 1 || wparam > binds.size())
+                return 0;
+            const auto& bind  = binds[wparam - 1];
+            const auto  reply = execute(std::format("/dispatch {} {}", bind.dispatcher, bind.argument));
+            if (reply.success && reply.exit)
                 action(EAction::Exit);
-            else if (wparam >= 5 && wparam <= 8) {
-                m_manager->focus(static_cast<EDirection>(wparam - 5));
+            else if (!reply.success)
                 update();
-            }
             return 0;
+        }
         case WM_PAINT: {
             PAINTSTRUCT paint{};
             BeginPaint(m_window, &paint);
@@ -279,6 +285,8 @@ LRESULT CApplication::message(UINT type, WPARAM wparam, LPARAM lparam) {
             for (int id : m_hotkeys)
                 UnregisterHotKey(m_window, id);
             m_hotkeys.clear();
+            m_ipc.reset();
+            m_commands.reset();
             m_manager.reset();
             PostQuitMessage(0);
             return 0;

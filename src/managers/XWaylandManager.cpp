@@ -1,4 +1,5 @@
 #include "XWaylandManager.hpp"
+#include <limits>
 #include "../helpers/MiscFunctions.hpp"
 #include "../desktop/state/FocusState.hpp"
 #include "../desktop/view/WLSurface.hpp"
@@ -76,7 +77,7 @@ Vector2D CHyprXWaylandManager::waylandToXWaylandCoords(const Vector2D& coord, PH
 
     PHLMONITOR  pMonitor = preferredMonitor;
     if (!pMonitor) {
-        double bestDistance = __FLT_MAX__;
+        double bestDistance = std::numeric_limits<float>::max();
         for (const auto& m : State::monitorState()->monitors()) {
             const auto SIZ = *PXWLFORCESCALEZERO ? m->m_transformedSize : m->m_size;
 
@@ -113,7 +114,7 @@ Vector2D CHyprXWaylandManager::xwaylandToWaylandCoords(const Vector2D& coord, PH
 
     PHLMONITOR  pMonitor = preferredMonitor;
     if (!pMonitor) {
-        double bestDistance = __FLT_MAX__;
+        double bestDistance = std::numeric_limits<float>::max();
         for (const auto& m : State::monitorState()->monitors()) {
             const auto SIZ = *PXWLFORCESCALEZERO ? m->m_transformedSize : m->m_size;
 

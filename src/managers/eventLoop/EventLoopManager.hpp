@@ -87,6 +87,13 @@ class CEventLoopManager {
         wl_event_source*        eventSource = nullptr;
     };
 
+#ifdef _WIN32
+    // Windows backends expose waitable handles instead of descriptors.
+    using PollKey = void*;
+#else
+    using PollKey = int;
+#endif
+
     struct {
         wl_event_loop*   loop        = nullptr;
         wl_display*      display     = nullptr;
@@ -95,12 +102,16 @@ class CEventLoopManager {
 
     struct {
         std::vector<SP<CEventLoopTimer>> timers;
-        Hyprutils::OS::CFileDescriptor   timerfd;
-        bool                             recalcScheduled = false;
+#ifdef _WIN32
+        wl_event_source* source = nullptr; // a wl_event_loop timer stands in for the timerfd
+#else
+        Hyprutils::OS::CFileDescriptor timerfd;
+#endif
+        bool recalcScheduled = false;
     } m_timers;
 
     SIdleData                        m_idle;
-    std::map<int, SEventSourceData>  m_aqEventSources;
+    std::map<PollKey, SEventSourceData> m_aqEventSources;
     std::vector<UP<SReadableWaiter>> m_readableWaiters;
 
     struct {
@@ -108,6 +119,9 @@ class CEventLoopManager {
     } m_listeners;
 
     wl_event_source* m_configWatcherInotifySource = nullptr;
+#ifdef _WIN32
+    wl_event_source* m_messageSource = nullptr;
+#endif
 
     friend class CAsyncDialogBox;
     friend class CMainLoopExecutor;

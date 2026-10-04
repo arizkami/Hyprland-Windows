@@ -10,9 +10,13 @@
 #include <cmath>
 #include <filesystem>
 #include <sys/utsname.h>
+#ifdef _WIN32
+#include "../../windows/platform/win32/ProcessInfo.hpp"
+#else
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <fcntl.h>
+#endif
 #include <iomanip>
 #include <sstream>
 #include <fstream>
@@ -156,7 +160,12 @@ float vecToRectDistanceSquared(const Vector2D& vec, const Vector2D& p1, const Ve
 
 // Execute a shell command and get the output
 std::string execAndGet(const char* cmd) {
+#ifdef _WIN32
+    // /s: cmd.exe strips exactly the outer quotes CProcess adds around the command.
+    CProcess proc("cmd.exe", {"/d", "/s", "/c", cmd});
+#else
     CProcess proc("/bin/sh", {"-c", cmd});
+#endif
 
     if (!proc.runSync())
         return "error";
@@ -165,7 +174,9 @@ std::string execAndGet(const char* cmd) {
 }
 
 int64_t getPPIDof(int64_t pid) {
-#if defined(KERN_PROC_PID)
+#if defined(_WIN32)
+    return sc<int64_t>(WindowsPlatform::parentProcessId(sc<uint64_t>(pid)));
+#elif defined(KERN_PROC_PID)
     int mib[] = {
         CTL_KERN,           KERN_PROC, KERN_PROC_PID, (int)pid,
 #if defined(__NetBSD__) || defined(__OpenBSD__)
@@ -257,6 +268,16 @@ void throwError(const std::string& err) {
     throw std::runtime_error(err);
 }
 
+#ifdef _WIN32
+// Shared-memory files carry keymaps and buffers to Wayland clients, which Windows does not have.
+CFileDescriptor allocateSHMFile(size_t len) {
+    return {};
+}
+
+bool allocateSHMFilePair(size_t size, CFileDescriptor& rw_fd_ptr, CFileDescriptor& ro_fd_ptr) {
+    return false;
+}
+#else
 std::pair<CFileDescriptor, std::string> openExclusiveShm() {
     // Only absolute paths can be shared across different shm_open() calls
     std::string name = std::format("/{}", g_pTokenManager->getRandomUUID());
@@ -322,6 +343,7 @@ bool allocateSHMFilePair(size_t size, CFileDescriptor& rw_fd_ptr, CFileDescripto
     ro_fd_ptr = std::move(ro_fd);
     return true;
 }
+#endif
 
 float stringToPercentage(const std::string& VALUE, const float REL) {
     if (VALUE.ends_with('%'))
@@ -379,6 +401,12 @@ std::expected<std::string, std::string> binaryNameForPid(pid_t pid) {
     if (pid <= 0)
         return std::unexpected("No pid for client");
 
+#ifdef _WIN32
+    if (auto path = WindowsPlatform::executablePath(sc<uint64_t>(pid)); path)
+        return *path;
+    return std::unexpected("cannot query the process image");
+#endif
+
 #if defined(KERN_PROC_PATHNAME)
     int mib[] = {
         CTL_KERN,
@@ -402,7 +430,7 @@ std::expected<std::string, std::string> binaryNameForPid(pid_t pid) {
 #endif
     std::error_code ec;
 
-    std::string     fullPath = std::filesystem::canonical(path, ec);
+    std::string     fullPath = std::filesystem::canonical(path, ec).string();
 
     if (ec)
         return std::unexpected("canonical failed");
